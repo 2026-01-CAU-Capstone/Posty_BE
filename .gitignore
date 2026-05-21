@@ -1,0 +1,11 @@
+node_modules
+.next
+data
+.env
+.env.local
+*.log
+assets/fonts/*.ttf
+assets/fonts/*.otf
+
+.claude/
+tsconfig.tsbuildinfo
