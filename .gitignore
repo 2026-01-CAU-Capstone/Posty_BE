@@ -9,3 +9,13 @@ assets/fonts/*.otf
 
 .claude/
 tsconfig.tsbuildinfo
+
+ig-fetch/.venv/
+ig-fetch/__pycache__/
+ig-fetch/**/__pycache__/
+ig-fetch/*.pyc
+ig-fetch/**/*.pyc
+ig-fetch/.env
+ig-fetch/storage/
+ig-fetch/*.egg-info/
+ig-fetch/.pytest_cache/
