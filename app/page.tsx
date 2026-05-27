@@ -120,6 +120,12 @@ export default function Page() {
   const [outlineBusy, setOutlineBusy] = useState<'' | 'generating' | 'saving' | 'confirming'>('');
   const [replanFeedback, setReplanFeedback] = useState<string>('');
   const [replanning, setReplanning] = useState<boolean>(false);
+  // ----- IG 자동 파이프라인 -----
+  const [autoRefUrl, setAutoRefUrl] = useState<string>('');
+  const [autoSourceUrls, setAutoSourceUrls] = useState<string>('');
+  const [autoRunning, setAutoRunning] = useState<boolean>(false);
+  const [autoSteps, setAutoSteps] = useState<{ step: string; msg: string; t: number }[]>([]);
+  const autoAbortRef = useRef<AbortController | null>(null);
   // 새 stage 결과를 받을 때마다 영상 URL 에 붙이는 캐시 버스터.
   // 같은 경로의 파일이 재생성돼도 브라우저가 옛 영상 들고 있는 문제 방지.
   const [cacheBust, setCacheBust] = useState<number>(() => Date.now());
@@ -334,6 +340,110 @@ export default function Page() {
     } catch (e: any) { setErr(e.message); } finally { setBusy(''); setBusyStage(null); }
   };
 
+  // ----- IG 자동 파이프라인 (ig-fetch → create → Stage 0 → Stage 1) -----
+  const cancelAutoPipeline = () => {
+    if (autoAbortRef.current) autoAbortRef.current.abort();
+  };
+
+  const runAutoPipeline = async () => {
+    const refUrl = autoRefUrl.trim();
+    const srcUrls = autoSourceUrls
+      .split(/\r?\n/)
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    if (!refUrl) { setErr('레퍼런스 IG URL 을 입력하세요'); return; }
+    if (srcUrls.length === 0) { setErr('소스 IG URL 을 1개 이상 입력하세요 (한 줄에 하나)'); return; }
+
+    setErr('');
+    setAutoRunning(true);
+    setAutoSteps([]);
+    setBusy('자동 파이프라인 실행 중');
+    setBusyStage(null);
+    appendLog(`▶ 자동 파이프라인 시작 (ref=1, sources=${srcUrls.length})`);
+
+    const ctrl = new AbortController();
+    autoAbortRef.current = ctrl;
+
+    try {
+      const res = await fetch('/api/auto-pipeline', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          referenceUrl: refUrl,
+          sourceUrls: srcUrls,
+          styleNote: styleNote || undefined,
+        }),
+        signal: ctrl.signal,
+      });
+
+      if (!res.ok && !res.body) {
+        const t = await res.text().catch(() => '');
+        throw new Error(`자동 파이프라인 시작 실패 (${res.status}): ${t}`);
+      }
+      if (!res.body) throw new Error('응답 body 없음');
+
+      // SSE 파싱: \n\n 로 끊어진 event 블록을 순차 처리
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      let resultProjectId = '';
+      let finalError = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        let idx: number;
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          const evt = parseSseBlock(block);
+          if (!evt) continue;
+
+          if (evt.event === 'progress') {
+            const step = String(evt.data.step || '');
+            const msg = String(evt.data.msg || '');
+            setAutoSteps(prev => [...prev, { step, msg, t: Date.now() }]);
+            appendLog(`  · ${msg}`);
+            // 새 projectId 가 progress 로 먼저 들어옴 — 즉시 UI 활성화
+            if (step === 'create_project' && evt.data.projectId) {
+              setProjectId(evt.data.projectId);
+            }
+          } else if (evt.event === 'done') {
+            resultProjectId = String(evt.data.projectId || '');
+          } else if (evt.event === 'error') {
+            finalError = String(evt.data.error || '알 수 없는 에러');
+            if (evt.data.projectId) resultProjectId = String(evt.data.projectId);
+          }
+        }
+      }
+
+      if (finalError) throw new Error(finalError);
+      if (!resultProjectId) throw new Error('서버가 projectId 를 반환하지 않음');
+
+      setProjectId(resultProjectId);
+      await refresh(resultProjectId);
+      const dur = Math.floor((Date.now() - startRef.current) / 1000);
+      appendLog(`✓ 자동 파이프라인 완료 (${fmtElapsed(dur)}): Stage 0~1 까지. 이후 Stage 2~4 는 수동 실행.`);
+      notifyComplete('자동 파이프라인 완료', `Stage 0~1 / ${fmtElapsed(dur)}`);
+    } catch (e: any) {
+      if (e.name === 'AbortError') {
+        appendLog('⛔ 자동 파이프라인 중단됨 (UI). 서버 작업은 백그라운드에서 계속될 수 있습니다.');
+      } else {
+        setErr(e.message || String(e));
+        appendLog(`✗ 자동 파이프라인 실패: ${e.message || e}`);
+        notifyComplete('자동 파이프라인 실패', String(e.message || e).slice(0, 100));
+      }
+    } finally {
+      autoAbortRef.current = null;
+      setAutoRunning(false);
+      setBusy('');
+      setBusyStage(null);
+    }
+  };
+
   const upload = async (kind: 'reference' | 'source' | 'bgm', files: FileList | null) => {
     if (!projectId) { setErr('먼저 프로젝트를 만드세요'); return; }
     if (!files || files.length === 0) return;
@@ -472,8 +582,78 @@ export default function Page() {
         </div>
       </Section>
 
+      {/* IG URL 자동 파이프라인 */}
+      <Section title="🚀 Instagram URL 로 자동 시작 (ig-fetch → 프로젝트 생성 → Stage 0~1)">
+        <div style={{ fontSize: 13, color: '#666', marginBottom: 8 }}>
+          ig-fetch 서버가 <code>{`http://localhost:8000`}</code> 에 떠 있어야 합니다 (별도 터미널).<br />
+          URL 만 넣으면 <b>다운로드 → 프로젝트 생성 → Stage 0 (분석) → Stage 1 (컷편집)</b> 까지 자동 진행합니다.
+          이후 Stage 2~4 는 아래 "단계 실행" 에서 수동으로 트리거하세요.
+        </div>
+
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 13, color: '#444', marginBottom: 2 }}>레퍼런스 URL (1개)</div>
+          <input
+            type="text"
+            value={autoRefUrl}
+            onChange={e => setAutoRefUrl(e.target.value)}
+            disabled={autoRunning || !!busy}
+            placeholder="https://www.instagram.com/reel/XXXXX/"
+            style={inputStyle}
+          />
+        </div>
+
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 13, color: '#444', marginBottom: 2 }}>
+            소스 URL (여러 개, 한 줄에 하나)
+          </div>
+          <textarea
+            value={autoSourceUrls}
+            onChange={e => setAutoSourceUrls(e.target.value)}
+            disabled={autoRunning || !!busy}
+            placeholder={'https://www.instagram.com/reel/AAA/\nhttps://www.instagram.com/p/BBB/\nhttps://www.instagram.com/reel/CCC/'}
+            rows={5}
+            style={{ ...inputStyle, fontFamily: 'monospace', fontSize: 12 }}
+          />
+        </div>
+
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          {!autoRunning ? (
+            <button
+              onClick={runAutoPipeline}
+              disabled={!!busy}
+              style={{ background: '#e8f6ee', borderColor: '#2a8', fontWeight: 600 }}
+            >
+              🚀 자동 실행 (Stage 0~1 까지)
+            </button>
+          ) : (
+            <button onClick={cancelAutoPipeline} style={{ background: '#fee', borderColor: '#e88' }}>
+              중단
+            </button>
+          )}
+          <span style={{ fontSize: 12, color: '#777' }}>
+            예상 소요: IG 다운로드 + Stage 0 (~1-3분) + Stage 1 (소스 1개당 ~1-2분)
+          </span>
+        </div>
+
+        {autoSteps.length > 0 && (
+          <div style={{
+            marginTop: 10, padding: 8, background: '#f7f7f9',
+            border: '1px solid #ddd', borderRadius: 6, fontSize: 12,
+            maxHeight: 200, overflowY: 'auto', fontFamily: 'monospace',
+          }}>
+            {autoSteps.map((s, i) => (
+              <div key={i}>
+                <span style={{ color: '#888' }}>[{new Date(s.t).toLocaleTimeString()}]</span>{' '}
+                <span style={{ color: '#a86b00' }}>{s.step}</span>{' '}
+                {s.msg}
+              </div>
+            ))}
+          </div>
+        )}
+      </Section>
+
       {/* 업로드 */}
-      <Section title="업로드">
+      <Section title="업로드 (수동)">
         <UploadRow
           label="레퍼런스 (1개, 필수)"
           accept="video/*"
@@ -781,6 +961,29 @@ export default function Page() {
 // ============================================================
 // 보조 함수
 // ============================================================
+
+function parseSseBlock(block: string): { event: string; data: any } | null {
+  // "event: progress\ndata: {...}" 형태의 SSE 블록을 파싱.
+  // event 가 없으면 'message' 가 기본. data 가 여러 줄이면 \n 으로 합침.
+  let event = 'message';
+  const dataLines: string[] = [];
+  for (const raw of block.split(/\r?\n/)) {
+    const line = raw.replace(/^\s+/, '');
+    if (!line || line.startsWith(':')) continue;
+    if (line.startsWith('event:')) {
+      event = line.slice(6).trim();
+    } else if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trim());
+    }
+  }
+  if (dataLines.length === 0) return null;
+  const raw = dataLines.join('\n');
+  try {
+    return { event, data: JSON.parse(raw) };
+  } catch {
+    return { event, data: { msg: raw } };
+  }
+}
 
 function fmtElapsed(sec: number): string {
   const m = Math.floor(sec / 60);

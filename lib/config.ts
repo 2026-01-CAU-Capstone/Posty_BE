@@ -27,6 +27,13 @@ export const config = {
   // -------- FFmpeg (모든 단계의 실제 영상 처리) --------
   FFMPEG_PATH: process.env.FFMPEG_PATH ?? 'ffmpeg',
   FFPROBE_PATH: process.env.FFPROBE_PATH ?? 'ffprobe',
+
+  // -------- ig-fetch (Instagram 다운로드 헬퍼 서비스) --------
+  // 사용자가 별도로 띄움: cd ig-fetch && uvicorn app.main:app --port 8000
+  IG_FETCH_BASE: process.env.IG_FETCH_BASE ?? 'http://localhost:8000',
+  // pending 폴링 한계 (각 URL 당)
+  IG_FETCH_POLL_TIMEOUT_MS: Number(process.env.IG_FETCH_POLL_TIMEOUT_MS ?? 180_000),
+  IG_FETCH_POLL_INTERVAL_MS: Number(process.env.IG_FETCH_POLL_INTERVAL_MS ?? 2000),
 };
 
 export type StageId = 0 | 1 | 2 | 3 | 4;
