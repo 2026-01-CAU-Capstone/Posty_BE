@@ -121,8 +121,10 @@ export default function Page() {
   const [replanFeedback, setReplanFeedback] = useState<string>('');
   const [replanning, setReplanning] = useState<boolean>(false);
   // ----- IG 자동 파이프라인 -----
+  const [autoRefMode, setAutoRefMode] = useState<'url' | 'file'>('url');
   const [autoRefUrl, setAutoRefUrl] = useState<string>('');
-  const [autoSourceUrls, setAutoSourceUrls] = useState<string>('');
+  const [autoRefFile, setAutoRefFile] = useState<File | null>(null);
+  const [autoSourceFiles, setAutoSourceFiles] = useState<File[]>([]);
   const [autoRunning, setAutoRunning] = useState<boolean>(false);
   const [autoSteps, setAutoSteps] = useState<{ step: string; msg: string; t: number }[]>([]);
   const autoAbortRef = useRef<AbortController | null>(null);
@@ -347,33 +349,47 @@ export default function Page() {
 
   const runAutoPipeline = async () => {
     const refUrl = autoRefUrl.trim();
-    const srcUrls = autoSourceUrls
-      .split(/\r?\n/)
-      .map(s => s.trim())
-      .filter(Boolean);
 
-    if (!refUrl) { setErr('레퍼런스 IG URL 을 입력하세요'); return; }
-    if (srcUrls.length === 0) { setErr('소스 IG URL 을 1개 이상 입력하세요 (한 줄에 하나)'); return; }
+    if (autoRefMode === 'url' && !refUrl) {
+      setErr('레퍼런스 IG URL 을 입력하세요');
+      return;
+    }
+    if (autoRefMode === 'file' && !autoRefFile) {
+      setErr('레퍼런스 파일을 선택하세요');
+      return;
+    }
+    if (autoSourceFiles.length === 0) {
+      setErr('소스 파일을 1개 이상 선택하세요');
+      return;
+    }
 
     setErr('');
     setAutoRunning(true);
     setAutoSteps([]);
     setBusy('자동 파이프라인 실행 중');
     setBusyStage(null);
-    appendLog(`▶ 자동 파이프라인 시작 (ref=1, sources=${srcUrls.length})`);
+    appendLog(
+      `▶ 자동 파이프라인 시작 (ref=${autoRefMode}, sources=${autoSourceFiles.length}개)`,
+    );
 
     const ctrl = new AbortController();
     autoAbortRef.current = ctrl;
 
     try {
+      const fd = new FormData();
+      if (autoRefMode === 'url') {
+        fd.append('referenceUrl', refUrl);
+      } else if (autoRefFile) {
+        fd.append('referenceFile', autoRefFile, autoRefFile.name);
+      }
+      for (const f of autoSourceFiles) {
+        fd.append('sourceFiles', f, f.name);
+      }
+      if (styleNote) fd.append('styleNote', styleNote);
+
       const res = await fetch('/api/auto-pipeline', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          referenceUrl: refUrl,
-          sourceUrls: srcUrls,
-          styleNote: styleNote || undefined,
-        }),
+        body: fd,
         signal: ctrl.signal,
       });
 
@@ -582,38 +598,82 @@ export default function Page() {
         </div>
       </Section>
 
-      {/* IG URL 자동 파이프라인 */}
-      <Section title="🚀 Instagram URL 로 자동 시작 (ig-fetch → 프로젝트 생성 → Stage 0~1)">
+      {/* 자동 파이프라인 — 레퍼런스(IG URL/파일) + 소스(로컬 파일) */}
+      <Section title="🚀 자동 시작 (레퍼런스 → 프로젝트 생성 → Stage 0~1)">
         <div style={{ fontSize: 13, color: '#666', marginBottom: 8 }}>
-          ig-fetch 서버가 <code>{`http://localhost:8000`}</code> 에 떠 있어야 합니다 (별도 터미널).<br />
-          URL 만 넣으면 <b>다운로드 → 프로젝트 생성 → Stage 0 (분석) → Stage 1 (컷편집)</b> 까지 자동 진행합니다.
+          <b>레퍼런스</b>는 IG URL 또는 로컬 파일, <b>소스</b>는 로컬 파일을 업로드합니다.<br />
+          레퍼런스가 IG URL 일 때만 ig-fetch 서버(<code>{`http://localhost:8000`}</code>)가 필요합니다.<br />
+          <b>다운로드/저장 → Stage 0 (분석) → Stage 1 (컷편집)</b> 까지 자동 진행하며,
           이후 Stage 2~4 는 아래 "단계 실행" 에서 수동으로 트리거하세요.
         </div>
 
         <div style={{ marginBottom: 8 }}>
-          <div style={{ fontSize: 13, color: '#444', marginBottom: 2 }}>레퍼런스 URL (1개)</div>
-          <input
-            type="text"
-            value={autoRefUrl}
-            onChange={e => setAutoRefUrl(e.target.value)}
-            disabled={autoRunning || !!busy}
-            placeholder="https://www.instagram.com/reel/XXXXX/"
-            style={inputStyle}
-          />
+          <div style={{ fontSize: 13, color: '#444', marginBottom: 4 }}>레퍼런스 (1개)</div>
+          <div style={{ display: 'flex', gap: 12, marginBottom: 6, fontSize: 13 }}>
+            <label style={{ cursor: 'pointer' }}>
+              <input
+                type="radio"
+                name="autoRefMode"
+                checked={autoRefMode === 'url'}
+                onChange={() => setAutoRefMode('url')}
+                disabled={autoRunning || !!busy}
+              />{' '}
+              IG URL
+            </label>
+            <label style={{ cursor: 'pointer' }}>
+              <input
+                type="radio"
+                name="autoRefMode"
+                checked={autoRefMode === 'file'}
+                onChange={() => setAutoRefMode('file')}
+                disabled={autoRunning || !!busy}
+              />{' '}
+              로컬 파일
+            </label>
+          </div>
+          {autoRefMode === 'url' ? (
+            <input
+              type="text"
+              value={autoRefUrl}
+              onChange={e => setAutoRefUrl(e.target.value)}
+              disabled={autoRunning || !!busy}
+              placeholder="https://www.instagram.com/reel/XXXXX/"
+              style={inputStyle}
+            />
+          ) : (
+            <div>
+              <input
+                type="file"
+                accept="video/*"
+                onChange={e => setAutoRefFile(e.target.files?.[0] ?? null)}
+                disabled={autoRunning || !!busy}
+              />
+              {autoRefFile && (
+                <span style={{ fontSize: 12, color: '#555', marginLeft: 8 }}>
+                  선택됨: {autoRefFile.name} ({(autoRefFile.size / 1024 / 1024).toFixed(1)} MB)
+                </span>
+              )}
+            </div>
+          )}
         </div>
 
         <div style={{ marginBottom: 8 }}>
-          <div style={{ fontSize: 13, color: '#444', marginBottom: 2 }}>
-            소스 URL (여러 개, 한 줄에 하나)
+          <div style={{ fontSize: 13, color: '#444', marginBottom: 4 }}>
+            소스 파일 (여러 개 선택 가능 — 사용자가 직접 찍은 영상)
           </div>
-          <textarea
-            value={autoSourceUrls}
-            onChange={e => setAutoSourceUrls(e.target.value)}
+          <input
+            type="file"
+            accept="video/*"
+            multiple
+            onChange={e => setAutoSourceFiles(Array.from(e.target.files ?? []))}
             disabled={autoRunning || !!busy}
-            placeholder={'https://www.instagram.com/reel/AAA/\nhttps://www.instagram.com/p/BBB/\nhttps://www.instagram.com/reel/CCC/'}
-            rows={5}
-            style={{ ...inputStyle, fontFamily: 'monospace', fontSize: 12 }}
           />
+          {autoSourceFiles.length > 0 && (
+            <div style={{ fontSize: 12, color: '#555', marginTop: 4 }}>
+              {autoSourceFiles.length}개 선택됨:{' '}
+              {autoSourceFiles.map(f => f.name).join(', ')}
+            </div>
+          )}
         </div>
 
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
