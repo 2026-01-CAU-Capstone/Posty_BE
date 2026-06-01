@@ -477,8 +477,8 @@ export default function Page() {
     } catch (e: any) { setErr(e.message); } finally { setBusy(''); setBusyStage(null); }
   };
 
-  const runStage = async (stage: 0 | 1 | 2 | 3 | 4) => {
-    if (!projectId) { setErr('먼저 프로젝트를 만드세요'); return; }
+  const runStage = async (stage: 0 | 1 | 2 | 3 | 4): Promise<boolean> => {
+    if (!projectId) { setErr('먼저 프로젝트를 만드세요'); return false; }
     setErr('');
     setBusy(`Stage ${stage} 실행 중`);
     setBusyStage(stage);
@@ -487,6 +487,7 @@ export default function Page() {
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
+    let ok = false;
     try {
       const res = await fetch('/api/run-stage', {
         method: 'POST',
@@ -500,6 +501,7 @@ export default function Page() {
       appendLog(`✓ Stage ${stage} 완료 (${fmtElapsed(dur)}): ${summarizeResult(j)}`);
       notifyComplete(`Stage ${stage} 완료`, `소요 ${fmtElapsed(dur)}`);
       await refresh();
+      ok = true;
     } catch (e: any) {
       if (e.name === 'AbortError') {
         appendLog(`⛔ Stage ${stage} 중단됨 (UI). 서버 작업은 백그라운드에서 계속될 수 있음 — 잠시 후 새로고침으로 확인하세요.`);
@@ -513,6 +515,59 @@ export default function Page() {
       setBusy('');
       setBusyStage(null);
     }
+    return ok;
+  };
+
+  // ----- Stage 0 → 4 전체 자동 실행 -----
+  // **무조건 처음부터 끝까지** 실행 (이미 완료된 단계도 다시 돌림).
+  // TTS enabled 면 Stage 4 직전에 나레이션 개요 자동 생성 + 자동 확정.
+  // (사용자 확정 단계는 건너뜀 — 결과 마음에 안 들면 Stage 4 만 따로 다시 돌리면 됨)
+  const runAll = async () => {
+    if (!projectId) { setErr('먼저 프로젝트를 만드세요'); return; }
+    if (busy) { setErr('다른 작업이 진행 중입니다'); return; }
+    setErr('');
+    appendLog('▶ 전체 자동 실행 시작 (Stage 0 → 4, 모든 단계 처음부터)');
+
+    const fetchLatest = async (): Promise<any> => {
+      try {
+        const r = await fetch(`/api/project?projectId=${projectId}`);
+        const j = await r.json();
+        return j?.ok ? j : null;
+      } catch { return null; }
+    };
+
+    for (const s of [0, 1, 2, 3, 4] as const) {
+      // Stage 4 직전 — TTS enabled 이면 outline 자동 생성 + 자동 확정
+      if (s === 4) {
+        const latest = (await fetchLatest()) || state;
+        if (latest?.ttsConfig?.enabled && !latest?.ttsOutline?.approved) {
+          if (!latest?.ttsOutline?.generated_at) {
+            appendLog('▶ 나레이션 개요 자동 생성');
+            await generateOutline();
+          }
+          appendLog('▶ 나레이션 개요 자동 확정 (한 번에 실행 모드)');
+          try {
+            await fetch('/api/tts-outline', {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ projectId, approved: true }),
+            });
+          } catch (e: any) {
+            appendLog(`✗ 개요 자동 확정 실패: ${e?.message || e}`);
+            return;
+          }
+        }
+      }
+
+      const ok = await runStage(s);
+      if (!ok) {
+        appendLog(`⛔ Stage ${s} 실패로 전체 실행 중단`);
+        return;
+      }
+    }
+
+    appendLog('✅ 전체 자동 실행 완료 (Stage 0 → 4)');
+    notifyComplete('전체 자동 실행 완료', 'Stage 0 → 4');
   };
 
   const cancel = () => {
@@ -753,6 +808,23 @@ export default function Page() {
 
       {/* 단계 */}
       <Section title="단계 실행">
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+          padding: 10, background: '#eef4ff', border: '1px solid #cdd9f3', borderRadius: 8, marginBottom: 12,
+        }}>
+          <button
+            onClick={runAll}
+            disabled={!projectId || !!busy || !refOk || !srcOk}
+            style={{ background: '#4a7ad6', color: '#fff', borderColor: '#4a7ad6', fontWeight: 600, padding: '8px 16px' }}
+          >
+            ⚡ 한 번에 실행 (Stage 0 → 4)
+          </button>
+          <span style={{ fontSize: 12, color: '#555' }}>
+            업로드 끝났으면 이 버튼 하나로 모든 단계 자동 실행.
+            <b> 이미 완료된 단계도 무조건 처음부터 다시 실행</b>합니다.
+            <b>TTS 활성</b> 시 나레이션 개요는 자동 생성·자동 확정 — 결과 마음에 안 들면 개요 편집 후 Stage 4 만 재실행하세요.
+          </span>
+        </div>
         {STAGE_INFO.map(s => {
           const { ok, reason } = canRun(s.id);
           const done = stageDone(s.id);
@@ -1053,8 +1125,24 @@ function fmtElapsed(sec: number): string {
 
 function summarizeResult(j: any): string {
   // 결과를 한 줄로
-  const keys = Object.keys(j).filter(k => !['ok', 'stage'].includes(k));
   const bits: string[] = [];
+
+  // 레퍼런스 BGM 지문인식 결과는 사람이 읽기 좋게 별도 표기
+  const rb = j.reference_bgm;
+  if (rb && typeof rb === 'object') {
+    if (rb.status === 'matched') {
+      const name = [rb.title, rb.artist].filter(Boolean).join(' - ') || '(제목 미상)';
+      const g = Array.isArray(rb.genres) && rb.genres.length ? ` [${rb.genres.join('/')}]` : '';
+      const link = rb.song_link || rb.spotify_url || rb.apple_url;
+      bits.push(`🎵 레퍼런스 원곡: "${name}"${g}${link ? ` → ${link}` : ''}`);
+    } else if (rb.status === 'no_match') {
+      bits.push('🎵 레퍼런스 원곡 식별 실패 (매칭 없음 — 무료트랙 자동매칭으로 진행)');
+    } else if (rb.status === 'error') {
+      bits.push('🎵 레퍼런스 원곡 식별 오류 (무료트랙 자동매칭으로 진행)');
+    }
+  }
+
+  const keys = Object.keys(j).filter(k => !['ok', 'stage', 'reference_bgm'].includes(k));
   for (const k of keys.slice(0, 6)) {
     const v = j[k];
     if (typeof v === 'object' && v !== null) bits.push(`${k}=${JSON.stringify(v).slice(0, 60)}`);

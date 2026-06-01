@@ -19,14 +19,28 @@ export const config = {
   GEMINI_TTS_MODEL: process.env.GEMINI_TTS_MODEL ?? 'gemini-2.5-flash-preview-tts',
   GEMINI_API_BASE: process.env.GEMINI_API_BASE ?? 'https://generativelanguage.googleapis.com',
 
-  // -------- OpenAI (Stage 1 매칭용 embedding) --------
+  // -------- OpenAI (Stage 1 매칭용 embedding + 긴 소스 축약 선별) --------
   OPENAI_API_KEY: process.env.OPENAI_API_KEY ?? '',
   OPENAI_EMBEDDING_MODEL: process.env.OPENAI_EMBEDDING_MODEL ?? 'text-embedding-3-small',
+  // 긴 소스 축약(reduce) 의 최종 컷 선별에 쓰는 chat 모델. 저렴/충분.
+  OPENAI_CHAT_MODEL: process.env.OPENAI_CHAT_MODEL ?? 'gpt-4o-mini',
   OPENAI_API_BASE: process.env.OPENAI_API_BASE ?? 'https://api.openai.com/v1',
 
   // -------- FFmpeg (모든 단계의 실제 영상 처리) --------
   FFMPEG_PATH: process.env.FFMPEG_PATH ?? 'ffmpeg',
   FFPROBE_PATH: process.env.FFPROBE_PATH ?? 'ffprobe',
+  // 선택: scene detection 의 decode 가속 (예: 'auto' | 'cuda' | 'd3d11va' | 'qsv' | 'dxva2').
+  // 빈 값이면 CPU 디코드. 노트북 GPU 에 따라 오히려 불안정(TDR/화면 깜빡임)할 수 있어 기본 비활성.
+  FFMPEG_HWACCEL: process.env.FFMPEG_HWACCEL ?? '',
+  // 선택(CPU 레버): scene detection 시 비참조(B) 프레임 decode 생략 → CPU 디코드량 ~30~50% 감소.
+  // 단 모션 많은 영상은 컷이 과분할될 수 있음. '1' 또는 'true' 로 켬. 기본 비활성.
+  FFMPEG_SCENE_SKIP_NONREF: ['1', 'true'].includes((process.env.FFMPEG_SCENE_SKIP_NONREF ?? '').toLowerCase()),
+
+  // -------- BGM 지문인식 (Stage 4: 레퍼런스에 실제 쓰인 곡 식별) --------
+  // AudD.io API 토큰. 비어 있으면 식별 단계는 건너뛰고 기존 vibe 매칭만 동작.
+  // 식별된 곡의 장르/시대 정보를 Internet Archive 검색에 힌트로 흘려 더 비슷한 무료 트랙을 찾는다.
+  // (식별된 상용곡 자체는 저작권상 결과물에 임베드하지 않는다 — 정보/가이드 용도)
+  AUDD_API_TOKEN: process.env.AUDD_API_TOKEN ?? '',
 
   // -------- ig-fetch (Instagram 다운로드 헬퍼 서비스) --------
   // 사용자가 별도로 띄움: cd ig-fetch && uvicorn app.main:app --port 8000
