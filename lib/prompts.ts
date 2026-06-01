@@ -65,13 +65,41 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
           "position": "top" | "center" | "bottom",
           "horizontal_align": "left" | "center" | "right",
           "size_level": "small" | "medium" | "large" | "huge",
-          "color_hex": string,                   // "#RRGGBB"
+          "color_hex": string,                   // "#RRGGBB" — 본문 글자 색
           "emphasis": "regular" | "bold" | "black",
           "italic": boolean,                     // 글자가 기울어져 있으면 true. 굵기와 직교한다.
           "font_category": "sans" | "serif" | "handwritten" | "condensed" | "rounded" | "display",
           "font_personality": "modern" | "vintage" | "playful" | "elegant" | "bold_impact" | "minimal" | "retro" | "handwritten_neat" | "handwritten_brush" | "display_decorative",
           "role": "hook" | "fact" | "punchline" | "question" | "cta" | "quote" | "label" | "emphasis" | "decoration",
-          "tone": "casual" | "formal" | "hype" | "poetic" | "informational" | "humorous" | "emotional"
+          "tone": "casual" | "formal" | "hype" | "poetic" | "informational" | "humorous" | "emotional",
+
+          "outline_color_hex": string,           // 글자 외곽선 색. 외곽선 없으면 ""
+          "outline_thickness": "none" | "thin" | "medium" | "thick",
+
+          "has_shadow": boolean,                 // 글자에 그림자가 보이면 true
+          "shadow_color_hex": string,            // 그림자 색. 보통 "#000000"
+          "shadow_blur": number,                 // 0~30. 그림자 흐림 정도. 또렷한 그림자면 0~3, 부드러운 글로우형이면 8~20
+
+          "has_background_box": boolean,         // 글자 뒤에 박스/박스형 배경이 있으면 true
+          "background_color_hex": string,        // 박스 색 (있을 때)
+          "background_alpha": number,            // 0~1. 박스 불투명도. 완전 불투명=1.0, 반투명=0.4~0.7, 거의 안 보이는 박스=0.2~0.3
+          "background_radius": number,           // 박스 모서리. 0=각진, 12=살짝 둥근, 999=알약형(pill)
+
+          "gradient": {                          // 글자 자체에 그라데이션이 보이면 type="linear", 아니면 type="none"
+            "type": "linear" | "none",
+            "angle": number,                     // 0=상→하, 90=좌→우, 180=하→상, 270=우→좌. 사선은 30/45/60 등.
+            "stops": [                           // 2개 이상. type="none" 이면 빈 배열.
+              { "offset": number, "color": string }   // offset 0~1, color "#RRGGBB"
+            ]
+          },
+
+          "has_glow": boolean,                   // 글자 주변에 빛나는 광이 보이면 true (네온/글로우 효과)
+          "glow_color_hex": string,              // 광 색. 보통 글자 색과 같거나 살짝 다른 색.
+          "glow_radius": number,                 // 5~30. 광의 퍼짐 정도
+
+          "letter_spacing": "tight" | "normal" | "wide",   // 자간. 일반은 normal.
+
+          "entry_animation": "none" | "fade"     // 자막 등장 방식. 갑작스럽게 나타나면 none, 부드럽게 페이드인이면 fade. 확실치 않으면 fade.
         }
       ],
       "required_tags": string[]                  // 이 컷 재현에 소스가 가져야 할 태그들 (snake_case 영어 권장)
@@ -107,6 +135,7 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
     "has_shadow": boolean,
     "has_background_box": boolean,               // 자막 뒤에 박스/박스형 배경
     "background_color_hex": string,              // 배경 박스 색. "#RRGGBB"
+    "background_alpha": number,                  // 0~1. 박스 불투명도. 1=완전 불투명, 0.4~0.7=반투명
     "size_level": "small" | "medium" | "large" | "huge"
   },
   "caption_pattern": {
@@ -163,6 +192,29 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
   · 색은 정확한 hex 가 어렵더라도 가장 가까운 값을 추정해라. 흰색은 "#FFFFFF", 검정은 "#000000", 노랑은 "#FFE600" 같은 식.
   · 글자가 굵으면 "bold", 아주 굵고 두꺼우면 "black", 일반 두께면 "regular".
   · 화면 대비 글자 비율이 작으면 "small", 일반적이면 "medium", 화면의 1/8 이상이면 "large", 화면을 거의 채우면 "huge".
+- **caption_layers 의 디자인 디테일 필드들 — 화면에서 보이는 그대로 정확히 채워라.**
+
+  ⚠⚠ **가독성 보장은 자막 디자인의 최우선 원칙이다.** 영상에 자막이 있으면 시청자가 1초 안에 읽을 수 있어야 한다. 따라서:
+  · 글자 색이 배경과 비슷한 명도면 (예: 밝은 배경 위 옅은 글자) 반드시 outline 또는 background_box 둘 중 하나는 보임. 둘 다 "없음" 으로 답하면 자막이 실제 영상에서 안 보였다는 것 — 거의 그런 경우는 없다.
+  · 시각적으로 외곽선이 가늘게라도 보이면 outline_thickness="thin" 으로 답하지 말고 **실제 픽셀 두께를 정직하게 추정**해라. 글자 굵기의 1/15 이하면 "thin", 1/8 ~ 1/15 이면 "medium", 그보다 굵으면 "thick".
+  · 그림자/외곽선이 둘 다 안 보여도 글자가 또렷이 잘 보이면 그건 배경이 충분히 어둡고 글자가 충분히 밝아 (또는 그 반대) 자연스러운 대비가 보장된 경우. 그렇지 않다면 반드시 outline 또는 box 가 있다.
+
+  · outline (글자 테두리): 글자 가장자리에 다른 색 윤곽선이 보이면 outline_color_hex 채우고 outline_thickness 정함. 윤곽선 없으면 outline_thickness="none". 글자색이 흰색이면 outline 은 보통 검정, 글자색이 검정이면 outline 은 보통 흰색.
+  · shadow (그림자): 글자 아래/뒤로 떨어지는 그림자가 보이면 has_shadow=true. 또렷한 한 방향 그림자면 shadow_blur=0~3, 부드럽게 퍼지면 8~20.
+  · **background_box (박스 배경)**: 글자 뒤에 검정/유색 박스가 깔려있으면 has_background_box=true.
+    박스가 시각적으로 거의 안 보이면 has_background_box=false.
+  · background_alpha: 박스 불투명도. 또렷한 솔리드 박스 = 1.0, 영상이 살짝 비치는 반투명 = 0.4~0.7, 거의 안 보이는 흐릿한 박스 = 0.2~0.3. 박스가 없으면(=false) 무시.
+  · background_radius: 모서리가 각지면 0, 살짝 둥글면 12~16, 알약형이면 999.
+  · background_color_hex: 박스 색은 글자와 명도가 명확히 차이나는 색. 흰 글자에 흰 박스 같은 답 금지.
+  · gradient (글자 자체 그라데이션): **글자 안에서 색이 변하면 type="linear" + stops 정확히**. 예) 위 빨강 → 아래 노랑이면 angle=0 + stops=[{offset:0,color:"#FF0000"},{offset:1,color:"#FFE600"}]. 그라데이션 없으면 type="none", stops=[].
+  · glow (글로우/네온): 글자 가장자리에서 같은 색 또는 살짝 다른 색이 빛나듯 퍼지면 has_glow=true. 네온 사인이나 노을빛 느낌이 단서.
+  · letter_spacing: 자간이 일반보다 좁아 보이면 "tight", 일반은 "normal", 넓게 띄워져 있으면 "wide".
+  · entry_animation: 자막이 갑자기 "탁" 튀어나오면 "none", 부드럽게 페이드인이면 "fade". 확신 못 하면 "fade".
+
+- **자가 검증 — caption_layers 작성 후 다음 질문에 모두 "예" 인지 확인:**
+  · 글자색과 배경의 명도 차이가 충분한가? 아니라면 outline_thickness 또는 has_background_box 둘 중 하나는 켜져 있나?
+  · outline_color_hex 는 글자색과 명도가 충분히 다른가? (흰 글자에 회색 외곽선 같은 답 금지)
+- **신규 디자인 필드들도 caption_global_style 의 has_outline/outline_color 와 일치해야 자연스럽다.** layer 별 outline 이 다른 영상이 아니면 모든 layer 의 outline_color_hex 가 동일.
 - 절대 JSON 외 텍스트 출력 금지.`;
 
 
@@ -207,7 +259,23 @@ shot_index 는 영상의 시각적 컷 순서로 0 부터 매기고, shot_start 
           "font_category": "sans" | "serif" | "handwritten" | "condensed" | "rounded" | "display",
           "font_personality": "modern" | "vintage" | "playful" | "elegant" | "bold_impact" | "minimal" | "retro" | "handwritten_neat" | "handwritten_brush" | "display_decorative",
           "role": "hook" | "fact" | "punchline" | "question" | "cta" | "quote" | "label" | "emphasis" | "decoration",
-          "tone": "casual" | "formal" | "hype" | "poetic" | "informational" | "humorous" | "emotional"
+          "tone": "casual" | "formal" | "hype" | "poetic" | "informational" | "humorous" | "emotional",
+
+          "outline_color_hex": string,
+          "outline_thickness": "none" | "thin" | "medium" | "thick",
+          "has_shadow": boolean,
+          "shadow_color_hex": string,
+          "shadow_blur": number,
+          "has_background_box": boolean,
+          "background_color_hex": string,
+          "background_alpha": number,
+          "background_radius": number,
+          "gradient": { "type": "linear" | "none", "angle": number, "stops": [ { "offset": number, "color": string } ] },
+          "has_glow": boolean,
+          "glow_color_hex": string,
+          "glow_radius": number,
+          "letter_spacing": "tight" | "normal" | "wide",
+          "entry_animation": "none" | "fade"
         }
       ]
     }
@@ -381,8 +449,17 @@ ${cutLines}
    - 예: subject_center_y 가 0.75 인 음식/제품 컷에서 ref 가 bottom 이면 top 으로 옮기는 편이 좋다.
    - 예: subject_center_y 가 0.25 인 얼굴 클로즈업에서 ref 가 top 이면 bottom 으로 옮기는 편이 좋다.
 
-7. **사이즈/색/굵기도 matched_ref_layers 그대로 복사가 기본.**
-   - 변형은 사용자 의도(styleNote) 가 명시할 때만.
+7. **사이즈/색/굵기 + 외곽선/그림자/박스배경/그라데이션/글로우/자간/등장애니메이션도 matched_ref_layers 그대로 복사가 기본.**
+   - matched_ref_layers 의 다음 필드들은 모두 그대로 복사:
+     · outline_color_hex, outline_thickness
+     · has_shadow, shadow_color_hex, shadow_blur
+     · has_background_box, background_color_hex, background_alpha, background_radius
+     · gradient (type / angle / stops 전체. stops 의 color 까지 정확히 같게)
+     · has_glow, glow_color_hex, glow_radius
+     · letter_spacing, entry_animation
+   - **임의로 디자인 값 만들어내지 마라.** ref 와 시각적으로 다르면 매칭의 의미가 사라진다.
+   - matched_ref_layers 가 비어있는 컷에서 자막을 새로 만들 때는 caption_global_style 의 has_outline / outline_color_hex / has_shadow / has_background_box / primary_color_hex 등을 따라가라.
+   - 사용자 styleNote 가 명시적으로 "박스 배경 빼라" 같은 지시를 했을 때만 변형.
 
 ═══════════════════════════════
 [응답 형식]
@@ -405,7 +482,23 @@ JSON 만 출력. 다른 텍스트 금지.
           "font_category": "sans" | "serif" | "handwritten" | "condensed" | "rounded" | "display",
           "font_personality": "modern" | "vintage" | "playful" | "elegant" | "bold_impact" | "minimal" | "retro" | "handwritten_neat" | "handwritten_brush" | "display_decorative",
           "role": "hook" | "fact" | "punchline" | "question" | "cta" | "quote" | "label" | "emphasis" | "decoration",
-          "tone": "casual" | "formal" | "hype" | "poetic" | "informational" | "humorous" | "emotional"
+          "tone": "casual" | "formal" | "hype" | "poetic" | "informational" | "humorous" | "emotional",
+
+          "outline_color_hex": string,
+          "outline_thickness": "none" | "thin" | "medium" | "thick",
+          "has_shadow": boolean,
+          "shadow_color_hex": string,
+          "shadow_blur": number,
+          "has_background_box": boolean,
+          "background_color_hex": string,
+          "background_alpha": number,
+          "background_radius": number,
+          "gradient": { "type": "linear" | "none", "angle": number, "stops": [ { "offset": number, "color": string } ] },
+          "has_glow": boolean,
+          "glow_color_hex": string,
+          "glow_radius": number,
+          "letter_spacing": "tight" | "normal" | "wide",
+          "entry_animation": "none" | "fade"
         }
       ]
     }
@@ -887,4 +980,57 @@ ${shotsJson}
   · 음식·제품을 테이블 위에서 찍은 경우 보통 (0.5, 0.55)
   · 셀카에서 인물이 화면 오른쪽에 있으면 (0.7, 0.45) 같은 식
 - 절대 JSON 외 텍스트 출력 금지.`;
+}
+
+// ============================================================
+// Stage 1 (긴 소스 축약): 후보 컷들 중에서 30~60초 릴스를 구성할
+// "최종 컷"을 골라 순서까지 정하는 OpenAI 선별 프롬프트.
+// 입력은 이미 (중복 제거 + 품질 필터) 거친 후보들.
+// ============================================================
+export function buildSourceReductionPrompt(args: {
+  candidates: Array<{
+    id: number;
+    video: string;
+    start: number;
+    duration: number;     // 실제 컷으로 쓸 길이 (≤4.5s 로 캡됨)
+    shot_type: string;
+    scene_description: string;
+    spoken_text: string;
+    tags: string[];
+    quality: number;
+  }>;
+  targetSec: number;       // 목표 길이 (예: 45)
+  minSec: number;          // 30
+  maxSec: number;          // 60
+  userDirectionBlock?: string;
+}): string {
+  const list = args.candidates.map(c =>
+    `  {"id":${c.id},"video":"${c.video}","dur":${c.duration.toFixed(2)},"type":"${c.shot_type}",` +
+    `"q":${c.quality.toFixed(2)},"desc":${JSON.stringify(c.scene_description)},` +
+    `"spoken":${JSON.stringify((c.spoken_text || '').slice(0, 120))},"tags":${JSON.stringify((c.tags || []).slice(0, 6))}}`,
+  ).join(',\n');
+
+  const direction = args.userDirectionBlock?.trim()
+    ? `\n[사용자 방향 — 선별·순서에 반영]\n${args.userDirectionBlock.trim()}\n`
+    : '';
+
+  return `너는 숏폼(릴스) 편집 디렉터다.
+긴 원본에서 추출한 "후보 컷" 목록을 준다. 이 중에서 시청 흐름이 좋은 ${args.minSec}~${args.maxSec}초짜리 릴스를 구성할 컷들을 골라 순서까지 정해라.
+${direction}
+[후보 컷] (dur=초, q=품질 0~1, desc/spoken/tags=내용 단서)
+[
+${list}
+]
+
+선별 규칙:
+- 고른 컷들의 dur 합이 ${args.minSec}~${args.maxSec}초가 되게 하라 (목표 ${args.targetSec}초 부근). 절대 ${args.maxSec}초를 넘기지 마라.
+- 비슷하거나 반복되는 장면은 가장 좋은 것 하나만. 다양한 shot_type/장면으로 변주를 줘라.
+- 품질(q)이 낮거나 의미 없는 컷은 버려라. 발화(spoken)나 임팩트가 있는 컷을 우선.
+- 도입(훅) → 전개 → 마무리 흐름이 자연스럽게 순서를 정해라. 영상 간 교차 배치 허용.
+- 반드시 입력에 존재하는 id 만 사용.
+
+아래 JSON 스키마로만 출력. 다른 텍스트/마크다운/코드펜스 금지.
+{
+  "selected": [number]   // 최종 컷 id 들을 "재생 순서대로". 위 규칙을 만족하는 부분집합.
+}`;
 }
