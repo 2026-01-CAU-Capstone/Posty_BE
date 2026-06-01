@@ -92,6 +92,7 @@ export async function extractFrame(
     '-y',
     '-ss', Math.max(0, timestamp).toFixed(3),
     '-i', filePath,
+    '-an',                 // 오디오 디코드 생략 (프레임 1장만 필요)
     '-frames:v', '1',
     '-vf', `scale=${width}:-2`,
     '-q:v', '4',
@@ -114,20 +115,54 @@ export async function extractAudio(filePath: string, outPath: string): Promise<v
   ]);
 }
 
+// 특정 시간 구간만 mp3 로 추출. 긴 소스를 batch 로 나눠 분석할 때 사용.
+// (-ss 를 -i 앞에 둬서 빠른 seek, -t 로 구간 길이 지정)
+export async function extractAudioRange(
+  filePath: string,
+  start: number,
+  duration: number,
+  outPath: string,
+): Promise<void> {
+  await runFfmpeg([
+    '-y',
+    '-ss', Math.max(0, start).toFixed(3),
+    '-i', filePath,
+    '-t', Math.max(0.1, duration).toFixed(3),
+    '-vn',
+    '-c:a', 'libmp3lame',
+    '-b:a', '48k',
+    '-ar', '24000',
+    '-ac', '1',
+    outPath,
+  ]);
+}
+
 // ---------- 컷 경계 검출 (scene detection) ----------
 // FFmpeg 의 select=gt(scene\,threshold) 로 큰 장면 변화 지점을 찾는다.
 // threshold 0.2~0.4 권장 (0 = 모든 프레임, 1 = 변화 없음).
 
 export type Shot = { start: number; end: number; duration: number };
 
+// scene 점수는 작은 해상도에서 계산해도 컷 경계는 거의 동일하게 잡힌다.
+// 풀 해상도(예 1080p, 2M px) 대신 높이 144 (~수만 px) 로 줄이면 scene 필터 비용이 픽셀 수만큼 급감.
+const SCENE_DETECT_HEIGHT = 144;
+
 export async function detectShots(filePath: string, threshold = 0.22): Promise<Shot[]> {
   const duration = await probeDuration(filePath);
   if (duration <= 0) return [];
 
+  const hw = (config.FFMPEG_HWACCEL || '').trim();
   const { stderr } = await runFfmpeg([
     '-hide_banner',
+    // (선택) GPU decode 가속. 빈 값이면 생략(CPU).
+    ...(hw ? ['-hwaccel', hw] : []),
+    // (선택) 비참조 프레임 decode 생략으로 CPU 디코드량 감소. (token 은 'noref' 가 정답)
+    ...(config.FFMPEG_SCENE_SKIP_NONREF ? ['-skip_frame', 'noref'] : []),
     '-i', filePath,
-    '-filter_complex', `select='gt(scene,${threshold})',showinfo`,
+    '-an',                                    // 오디오 디코드 생략
+    // scale 을 select 앞에 둬서 scene 점수/showinfo 계산을 작은 프레임에서 수행.
+    // pts(타임스탬프) 는 scale 과 무관하게 원본 기준 그대로라 컷 경계 정확도 유지.
+    '-filter_complex', `scale=-2:${SCENE_DETECT_HEIGHT}:flags=fast_bilinear,select='gt(scene,${threshold})',showinfo`,
     '-f', 'null',
     '-',
   ]).catch(e => ({ stderr: String(e?.message ?? e), stdout: '' } as any));
