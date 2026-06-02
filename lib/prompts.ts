@@ -427,6 +427,26 @@ ${modeBlock}
 ═══════════════════════════════
 ${refLines || '(레퍼런스에 텍스트 오버레이 없음)'}
 
+═══════════════════════════════
+[⚠ ref 자막 중 "영상 콘텐츠와 무관한 메타" 는 분석·치환·재사용 모두에서 제외]
+═══════════════════════════════
+다음 패턴의 ref 자막은 영상이 전하려는 메시지가 아니라 운영용 메타 정보다.
+**아래 6개 패턴에 해당하는 layer 는 없는 것으로 간주하고 사용자 컷에도 옮기지 마라.**
+
+  a) 출처/크레딧 — "출처: @user", "by @author", "Credit ...", "원본 ..."
+  b) 음악/BGM 정보 — "♪ Song Title - Artist", "Music by ...", "BGM ..."
+  c) SNS 핸들/해시태그가 단독 — "@username", "#hashtag" (한 layer 가 거의 핸들만일 때.
+     본문 안에 자연스럽게 섞여 있으면 그건 콘텐츠의 일부)
+  d) 광고/쿠폰/홍보 — "선착순", "쿠폰코드 XXXX", "지금 신청", "광고/협찬 문의", "DM 주세요"
+  e) 워터마크형 가게·브랜드·URL — 한 컷에만 작게 고정된 가게명·도메인·로고 텍스트
+  f) 페이지/날짜 헤더 — "1/5", "Day 3", "2025.06.02", "EP.02" 같은 단독 표기
+
+한 layer 안에 콘텐츠 + 메타가 같이 있으면 (예: "오늘은 떡볶이 by @user") 메타 부분만 떼고
+콘텐츠 부분("오늘은 떡볶이")만 참고한다.
+
+분석할 때, 치환 예시를 만들 때, frequency·key_phrases·recurring_structures 를 따를 때
+**모두 위 메타 layer 를 제외한 "콘텐츠 layer" 만 대상**으로 계산해라.
+
 위 ref 텍스트의 **실제 문구를 직접 보고 분석**해라:
 - 어떤 단어/명사가 반복되는가
 - 문장 구조가 무엇인가 (예: "오늘은 [N]", "[V]어봐", "[숫자]초만에 [V]")
@@ -494,6 +514,15 @@ ${cutLines}
    - 임의로 sans 로 통일하거나 다른 카테고리/인상으로 바꾸지 마라.
    - matched_ref_layers 가 비어있고 자막을 새로 만든다면 ref 전체 폰트 다양성을 따라가라.
    - font_personality 는 빈 값으로 두지 말고 ref 와 가장 유사한 값으로 반드시 채워라.
+
+4-bis. **🔥 size_level (글자 크기) 도 ref 그대로 복사 — 절대 임의 변경 금지.**
+   - 컷의 matched_ref_layers 의 size_level 을 layer 순서대로 그대로 사용해라 (small/medium/large/huge).
+   - "텍스트가 길어서 작아져야 할 것 같다" 같은 추측으로 임의로 small 로 떨어뜨리지 마라.
+     렌더 단계에서 width fit 이 알아서 폰트를 줄인다. **너의 일은 ref 의 "사이즈 위계" 를 그대로 옮기는 것.**
+   - 예: ref 의 huge 자막이 사용자 컷에서도 huge 여야 한다 (글자 수 무관). large 면 large, medium 이면 medium.
+   - **이 size_level 필드는 빈 값이나 누락 절대 금지. 모든 layer 가 4개 enum 중 하나로 반드시 지정한다.**
+   - matched_ref_layers 가 비어있는 컷에서 새로 만들 때는 ref pattern 의 size_contrast 와 layer_count_typical
+     을 보고 결정. uniform 이면 일관 medium, alternating/dramatic 이면 hook 은 huge/large, fact 는 medium.
 
 5. **자막은 자연스러운 곳에만. 모든 컷에 강제로 넣지 마라.**
    - ref frequency 가 "rare" / "occasional" 면 사용자 컷도 절반 이하만 자막.
