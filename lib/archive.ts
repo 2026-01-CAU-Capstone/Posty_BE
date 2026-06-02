@@ -40,6 +40,9 @@ export type BgmProfile = {
   bgm_tempo?: string;
   bgm_energy?: string;
   bgm_instruments?: string[];
+  // 지문인식(BGM identify)으로 식별된 곡의 장르를 royalty-free 검색어로 매핑한 힌트.
+  // 있으면 가장 우선순위 높은 검색/스코어링에 반영한다.
+  extra_terms?: string[];
 };
 
 // ============================================================
@@ -56,7 +59,16 @@ function buildQueriesFromProfile(p: BgmProfile): string[] {
     : [];
 
   const moodSet = moodSynonyms(mood);
+  const extras = Array.isArray(p.extra_terms) ? p.extra_terms.map(norm).filter(Boolean) : [];
   const queries: string[] = [];
+
+  // 0) 식별된 곡 장르 힌트 (extra_terms) — 가장 구체적. instrumental 로 한정해 무료음원 적중률↑.
+  for (const t of extras.slice(0, 3)) {
+    queries.push(`(${base}) AND (subject:(${t} instrumental) OR title:(${t}) OR subject:(${t} ${moodSet[0] || ''}))`);
+  }
+  if (extras[0] && genre) {
+    queries.push(`(${base}) AND (subject:(${genre} ${extras[0]}) OR title:(${genre} ${extras[0]}))`);
+  }
 
   // 1) genre + mood (가장 구체적)
   for (const m of moodSet.slice(0, 2)) {
@@ -220,7 +232,9 @@ function profileTerms(p: BgmProfile): string[] {
   const insts = Array.isArray(p.bgm_instruments)
     ? p.bgm_instruments.map(norm).filter(Boolean)
     : [];
+  const extras = Array.isArray(p.extra_terms) ? p.extra_terms.map(norm).filter(Boolean) : [];
   return [
+    ...extras,
     norm(p.bgm_genre),
     norm(p.bgm_energy),
     norm(p.bgm_tempo),

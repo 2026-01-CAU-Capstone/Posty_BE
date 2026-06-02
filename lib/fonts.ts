@@ -145,19 +145,21 @@ const BY_CATEGORY: Record<string, string[]> = {
   display:     [F.BlackHanSans, F.DoHyeon, F.Jua, F.YeonSung],
 };
 
-// emphasis=black 시 우선시할 헤비웨이트 폰트 (한글에서 weight 900 효과를 family로 흉내냄)
+// emphasis=black / bold+bold_impact 시 우선시할 헤비웨이트 폰트.
+// 한글에서 weight 900 효과를 family로 흉내냄 (libass 의 ASS Bold 는 인공 굵기라 어색).
 const HEAVY_FONTS = new Set<string>([F.BlackHanSans, F.DoHyeon, F.Jua]);
+
+// "강한 인상" 이 필요한 personality — 여기서는 bold 도 heavy 로 승급.
+const HEAVY_FOR_BOLD_PERSONALITIES = new Set<string>(['bold_impact', 'retro', 'display_decorative']);
 
 export function pickBundledFont(args: {
   category?: string;
   personality?: string;
   emphasis?: string;        // regular | bold | black
-  layerIndex?: number;      // 같은 컷 안에서 layer 가 다른 폰트로 가도록 분기
 }): string {
   const cat = (args.category || 'sans').toLowerCase();
   const per = (args.personality || '').toLowerCase();
   const emp = (args.emphasis || 'bold').toLowerCase();
-  const idx = Math.max(0, args.layerIndex ?? 0);
 
   // 1) (category, personality) 정확 매칭
   let pool: string[] | undefined;
@@ -169,11 +171,21 @@ export function pickBundledFont(args: {
   // 4) 최후 폴백
   if (!pool || pool.length === 0) pool = [F.Pretendard];
 
-  // emphasis=black 이고 풀에 헤비폰트가 있으면 우선
+  // emphasis=black 이면 무조건 heavy 폰트 우선
   if (emp === 'black') {
     const heavy = pool.find(f => HEAVY_FONTS.has(f));
     if (heavy) return heavy;
   }
+  // emphasis=bold + 강한 personality 면 heavy 폰트 우선 (ASS 인공 굵기 대신 family 로 굵기 표현)
+  if (emp === 'bold' && HEAVY_FOR_BOLD_PERSONALITIES.has(per)) {
+    const heavy = pool.find(f => HEAVY_FONTS.has(f));
+    if (heavy) return heavy;
+  }
 
-  return pool[idx % pool.length];
+  // ─────────────────────────────────────────────────────
+  // 같은 (category, personality) 면 항상 같은 폰트 → 영상 내 일관성.
+  // (이전엔 layerIndex 로 분기해서 같은 ref 패턴의 인접 layer 가 다른 폰트로 뽑히곤 했음 — ref 와 괴리의 한 원인)
+  // 첫 폰트가 가장 representative 라는 규약으로 BY_COMBO/BY_PERSONALITY 풀을 정렬해두고, 그 첫 폰트만 사용.
+  // ─────────────────────────────────────────────────────
+  return pool[0];
 }

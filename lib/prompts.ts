@@ -2,7 +2,67 @@
 // 모든 LLM 프롬프트 한 곳에서 관리.
 // - REFERENCE_ANALYSIS_PROMPT : Stage 0, Gemini Pro
 // - SOURCE_SHOT_DESCRIPTION_PROMPT : Stage 1, Gemini Flash
+// - buildStyleSuggestPrompt        : Stage 0.5, OpenAI gpt-4o-mini (chat JSON)
+//   (분석 결과 → 마스코트 한 줄 요약 + 옵션 자동 채우기)
 // ============================================================
+
+// ============================================================
+// Stage 0.5 — 분석된 edit-spec.json 을 보고
+//   (1) 마스코트가 사용자에게 건넬 한 줄 요약
+//   (2) 편집 옵션 자동 추천 (사용자가 수정 가능)
+// 을 함께 만들어 돌려준다.
+// ============================================================
+export function buildStyleSuggestPrompt(args: {
+  specSummary: string;
+  styleNote: string;
+}): string {
+  const noteBlock = args.styleNote.trim()
+    ? `\n사용자가 미리 적어둔 자유 노트(있다면 옵션 추천에 반영):\n${args.styleNote.trim()}\n`
+    : '';
+  return `너는 숏폼(릴스/틱톡) 편집 어시스턴트인 곰돌이 마스코트 "Posty" 다.
+사용자가 방금 레퍼런스 영상 1개를 분석해서 결과가 나왔다.
+이 결과를 보고 두 가지를 만들어라.
+
+[1] summary — 마스코트가 사용자에게 건넬 자연스러운 한 줄.
+  - 톤: 친근하고 가볍게. 반말이나 존댓말 모두 가능하지만 너무 딱딱하지 않게.
+  - 형식 예: "아 ~~한 분위기의 릴스를 올리셨군요!", "오~ ~~ 영상이네요!", "~~한 느낌, 좋아요!"
+  - 영상의 핵심 내용·분위기·소재를 한 줄로 요약 (피사체 / 색감 / 페이싱 등).
+  - 최대 80자 (한글 기준).
+
+[2] brief — 사용자가 이어서 채워야 할 편집 옵션을 미리 추천.
+  - 사용자는 받은 값을 그대로 쓰거나 자유롭게 수정한다. 너무 좁게 잡지 말고 영상 내용에서 자연스럽게 뽑아낼 것.
+  - tone : 한 줄, 한국어. 예: "발랄한", "잔잔한", "감성적인", "에너지 넘치는"
+  - purpose : 한 줄, 한국어. 예: "카페 홍보", "여행 vlog", "제품 리뷰", "맛집 추천"
+  - topic_keywords : 5~10개 한국어 키워드. 영상의 주제·소재·분위기·장소·색감 등.
+    각 키워드는 짧게 (1~6자 권장). 예: ["맥주", "이자카야", "노을", "감성", "친구"]
+  - must_include_phrases : 0~3개. 자막에 자연스럽게 들어가면 좋을 짧은 한국어 문구.
+    꼭 필요하지 않으면 빈 배열로. 예: ["오늘 퇴근 후", "딱 한 잔"]
+  - caption_language : "ko" / "en" / "mixed" 중 하나.
+    레퍼런스 자막이 한글이면 "ko", 영어면 "en", 둘 다면 "mixed".
+  - caption_density : "every_cut" / "most_cuts" / "occasional" / "minimal" / "none" 중 하나.
+    레퍼런스에 자막이 매 컷마다 있으면 "every_cut", 거의 있으면 "most_cuts",
+    띄엄띄엄이면 "occasional", 한두 번이면 "minimal", 없으면 "none".
+
+레퍼런스 분석 요약:
+\`\`\`
+${args.specSummary}
+\`\`\`
+${noteBlock}
+JSON 만 출력. 다른 텍스트/마크다운/코드펜스 금지.
+
+{
+  "summary": string,
+  "brief": {
+    "tone": string,
+    "purpose": string,
+    "topic_keywords": string[],
+    "must_include_phrases": string[],
+    "caption_language": "ko" | "en" | "mixed",
+    "caption_density": "every_cut" | "most_cuts" | "occasional" | "minimal" | "none"
+  }
+}
+`;
+}
 
 // ============================================================
 // 사용자 스타일 노트 주입 헬퍼
@@ -65,13 +125,41 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
           "position": "top" | "center" | "bottom",
           "horizontal_align": "left" | "center" | "right",
           "size_level": "small" | "medium" | "large" | "huge",
-          "color_hex": string,                   // "#RRGGBB"
+          "color_hex": string,                   // "#RRGGBB" — 본문 글자 색
           "emphasis": "regular" | "bold" | "black",
           "italic": boolean,                     // 글자가 기울어져 있으면 true. 굵기와 직교한다.
           "font_category": "sans" | "serif" | "handwritten" | "condensed" | "rounded" | "display",
           "font_personality": "modern" | "vintage" | "playful" | "elegant" | "bold_impact" | "minimal" | "retro" | "handwritten_neat" | "handwritten_brush" | "display_decorative",
           "role": "hook" | "fact" | "punchline" | "question" | "cta" | "quote" | "label" | "emphasis" | "decoration",
-          "tone": "casual" | "formal" | "hype" | "poetic" | "informational" | "humorous" | "emotional"
+          "tone": "casual" | "formal" | "hype" | "poetic" | "informational" | "humorous" | "emotional",
+
+          "outline_color_hex": string,           // 글자 외곽선 색. 외곽선 없으면 ""
+          "outline_thickness": "none" | "thin" | "medium" | "thick",
+
+          "has_shadow": boolean,                 // 글자에 그림자가 보이면 true
+          "shadow_color_hex": string,            // 그림자 색. 보통 "#000000"
+          "shadow_blur": number,                 // 0~30. 그림자 흐림 정도. 또렷한 그림자면 0~3, 부드러운 글로우형이면 8~20
+
+          "has_background_box": boolean,         // 글자 뒤에 박스/박스형 배경이 있으면 true
+          "background_color_hex": string,        // 박스 색 (있을 때)
+          "background_alpha": number,            // 0~1. 박스 불투명도. 완전 불투명=1.0, 반투명=0.4~0.7, 거의 안 보이는 박스=0.2~0.3
+          "background_radius": number,           // 박스 모서리. 0=각진, 12=살짝 둥근, 999=알약형(pill)
+
+          "gradient": {                          // 글자 자체에 그라데이션이 보이면 type="linear", 아니면 type="none"
+            "type": "linear" | "none",
+            "angle": number,                     // 0=상→하, 90=좌→우, 180=하→상, 270=우→좌. 사선은 30/45/60 등.
+            "stops": [                           // 2개 이상. type="none" 이면 빈 배열.
+              { "offset": number, "color": string }   // offset 0~1, color "#RRGGBB"
+            ]
+          },
+
+          "has_glow": boolean,                   // 글자 주변에 빛나는 광이 보이면 true (네온/글로우 효과)
+          "glow_color_hex": string,              // 광 색. 보통 글자 색과 같거나 살짝 다른 색.
+          "glow_radius": number,                 // 5~30. 광의 퍼짐 정도
+
+          "letter_spacing": "tight" | "normal" | "wide",   // 자간. 일반은 normal.
+
+          "entry_animation": "none" | "fade"     // 자막 등장 방식. 갑작스럽게 나타나면 none, 부드럽게 페이드인이면 fade. 확실치 않으면 fade.
         }
       ],
       "required_tags": string[]                  // 이 컷 재현에 소스가 가져야 할 태그들 (snake_case 영어 권장)
@@ -107,6 +195,7 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
     "has_shadow": boolean,
     "has_background_box": boolean,               // 자막 뒤에 박스/박스형 배경
     "background_color_hex": string,              // 배경 박스 색. "#RRGGBB"
+    "background_alpha": number,                  // 0~1. 박스 불투명도. 1=완전 불투명, 0.4~0.7=반투명
     "size_level": "small" | "medium" | "large" | "huge"
   },
   "caption_pattern": {
@@ -163,6 +252,29 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
   · 색은 정확한 hex 가 어렵더라도 가장 가까운 값을 추정해라. 흰색은 "#FFFFFF", 검정은 "#000000", 노랑은 "#FFE600" 같은 식.
   · 글자가 굵으면 "bold", 아주 굵고 두꺼우면 "black", 일반 두께면 "regular".
   · 화면 대비 글자 비율이 작으면 "small", 일반적이면 "medium", 화면의 1/8 이상이면 "large", 화면을 거의 채우면 "huge".
+- **caption_layers 의 디자인 디테일 필드들 — 화면에서 보이는 그대로 정확히 채워라.**
+
+  ⚠⚠ **가독성 보장은 자막 디자인의 최우선 원칙이다.** 영상에 자막이 있으면 시청자가 1초 안에 읽을 수 있어야 한다. 따라서:
+  · 글자 색이 배경과 비슷한 명도면 (예: 밝은 배경 위 옅은 글자) 반드시 outline 또는 background_box 둘 중 하나는 보임. 둘 다 "없음" 으로 답하면 자막이 실제 영상에서 안 보였다는 것 — 거의 그런 경우는 없다.
+  · 시각적으로 외곽선이 가늘게라도 보이면 outline_thickness="thin" 으로 답하지 말고 **실제 픽셀 두께를 정직하게 추정**해라. 글자 굵기의 1/15 이하면 "thin", 1/8 ~ 1/15 이면 "medium", 그보다 굵으면 "thick".
+  · 그림자/외곽선이 둘 다 안 보여도 글자가 또렷이 잘 보이면 그건 배경이 충분히 어둡고 글자가 충분히 밝아 (또는 그 반대) 자연스러운 대비가 보장된 경우. 그렇지 않다면 반드시 outline 또는 box 가 있다.
+
+  · outline (글자 테두리): 글자 가장자리에 다른 색 윤곽선이 보이면 outline_color_hex 채우고 outline_thickness 정함. 윤곽선 없으면 outline_thickness="none". 글자색이 흰색이면 outline 은 보통 검정, 글자색이 검정이면 outline 은 보통 흰색.
+  · shadow (그림자): 글자 아래/뒤로 떨어지는 그림자가 보이면 has_shadow=true. 또렷한 한 방향 그림자면 shadow_blur=0~3, 부드럽게 퍼지면 8~20.
+  · **background_box (박스 배경)**: 글자 뒤에 검정/유색 박스가 깔려있으면 has_background_box=true.
+    박스가 시각적으로 거의 안 보이면 has_background_box=false.
+  · background_alpha: 박스 불투명도. 또렷한 솔리드 박스 = 1.0, 영상이 살짝 비치는 반투명 = 0.4~0.7, 거의 안 보이는 흐릿한 박스 = 0.2~0.3. 박스가 없으면(=false) 무시.
+  · background_radius: 모서리가 각지면 0, 살짝 둥글면 12~16, 알약형이면 999.
+  · background_color_hex: 박스 색은 글자와 명도가 명확히 차이나는 색. 흰 글자에 흰 박스 같은 답 금지.
+  · gradient (글자 자체 그라데이션): **글자 안에서 색이 변하면 type="linear" + stops 정확히**. 예) 위 빨강 → 아래 노랑이면 angle=0 + stops=[{offset:0,color:"#FF0000"},{offset:1,color:"#FFE600"}]. 그라데이션 없으면 type="none", stops=[].
+  · glow (글로우/네온): 글자 가장자리에서 같은 색 또는 살짝 다른 색이 빛나듯 퍼지면 has_glow=true. 네온 사인이나 노을빛 느낌이 단서.
+  · letter_spacing: 자간이 일반보다 좁아 보이면 "tight", 일반은 "normal", 넓게 띄워져 있으면 "wide".
+  · entry_animation: 자막이 갑자기 "탁" 튀어나오면 "none", 부드럽게 페이드인이면 "fade". 확신 못 하면 "fade".
+
+- **자가 검증 — caption_layers 작성 후 다음 질문에 모두 "예" 인지 확인:**
+  · 글자색과 배경의 명도 차이가 충분한가? 아니라면 outline_thickness 또는 has_background_box 둘 중 하나는 켜져 있나?
+  · outline_color_hex 는 글자색과 명도가 충분히 다른가? (흰 글자에 회색 외곽선 같은 답 금지)
+- **신규 디자인 필드들도 caption_global_style 의 has_outline/outline_color 와 일치해야 자연스럽다.** layer 별 outline 이 다른 영상이 아니면 모든 layer 의 outline_color_hex 가 동일.
 - 절대 JSON 외 텍스트 출력 금지.`;
 
 
@@ -207,7 +319,23 @@ shot_index 는 영상의 시각적 컷 순서로 0 부터 매기고, shot_start 
           "font_category": "sans" | "serif" | "handwritten" | "condensed" | "rounded" | "display",
           "font_personality": "modern" | "vintage" | "playful" | "elegant" | "bold_impact" | "minimal" | "retro" | "handwritten_neat" | "handwritten_brush" | "display_decorative",
           "role": "hook" | "fact" | "punchline" | "question" | "cta" | "quote" | "label" | "emphasis" | "decoration",
-          "tone": "casual" | "formal" | "hype" | "poetic" | "informational" | "humorous" | "emotional"
+          "tone": "casual" | "formal" | "hype" | "poetic" | "informational" | "humorous" | "emotional",
+
+          "outline_color_hex": string,
+          "outline_thickness": "none" | "thin" | "medium" | "thick",
+          "has_shadow": boolean,
+          "shadow_color_hex": string,
+          "shadow_blur": number,
+          "has_background_box": boolean,
+          "background_color_hex": string,
+          "background_alpha": number,
+          "background_radius": number,
+          "gradient": { "type": "linear" | "none", "angle": number, "stops": [ { "offset": number, "color": string } ] },
+          "has_glow": boolean,
+          "glow_color_hex": string,
+          "glow_radius": number,
+          "letter_spacing": "tight" | "normal" | "wide",
+          "entry_animation": "none" | "fade"
         }
       ]
     }
@@ -299,6 +427,26 @@ ${modeBlock}
 ═══════════════════════════════
 ${refLines || '(레퍼런스에 텍스트 오버레이 없음)'}
 
+═══════════════════════════════
+[⚠ ref 자막 중 "영상 콘텐츠와 무관한 메타" 는 분석·치환·재사용 모두에서 제외]
+═══════════════════════════════
+다음 패턴의 ref 자막은 영상이 전하려는 메시지가 아니라 운영용 메타 정보다.
+**아래 6개 패턴에 해당하는 layer 는 없는 것으로 간주하고 사용자 컷에도 옮기지 마라.**
+
+  a) 출처/크레딧 — "출처: @user", "by @author", "Credit ...", "원본 ..."
+  b) 음악/BGM 정보 — "♪ Song Title - Artist", "Music by ...", "BGM ..."
+  c) SNS 핸들/해시태그가 단독 — "@username", "#hashtag" (한 layer 가 거의 핸들만일 때.
+     본문 안에 자연스럽게 섞여 있으면 그건 콘텐츠의 일부)
+  d) 광고/쿠폰/홍보 — "선착순", "쿠폰코드 XXXX", "지금 신청", "광고/협찬 문의", "DM 주세요"
+  e) 워터마크형 가게·브랜드·URL — 한 컷에만 작게 고정된 가게명·도메인·로고 텍스트
+  f) 페이지/날짜 헤더 — "1/5", "Day 3", "2025.06.02", "EP.02" 같은 단독 표기
+
+한 layer 안에 콘텐츠 + 메타가 같이 있으면 (예: "오늘은 떡볶이 by @user") 메타 부분만 떼고
+콘텐츠 부분("오늘은 떡볶이")만 참고한다.
+
+분석할 때, 치환 예시를 만들 때, frequency·key_phrases·recurring_structures 를 따를 때
+**모두 위 메타 layer 를 제외한 "콘텐츠 layer" 만 대상**으로 계산해라.
+
 위 ref 텍스트의 **실제 문구를 직접 보고 분석**해라:
 - 어떤 단어/명사가 반복되는가
 - 문장 구조가 무엇인가 (예: "오늘은 [N]", "[V]어봐", "[숫자]초만에 [V]")
@@ -367,6 +515,15 @@ ${cutLines}
    - matched_ref_layers 가 비어있고 자막을 새로 만든다면 ref 전체 폰트 다양성을 따라가라.
    - font_personality 는 빈 값으로 두지 말고 ref 와 가장 유사한 값으로 반드시 채워라.
 
+4-bis. **🔥 size_level (글자 크기) 도 ref 그대로 복사 — 절대 임의 변경 금지.**
+   - 컷의 matched_ref_layers 의 size_level 을 layer 순서대로 그대로 사용해라 (small/medium/large/huge).
+   - "텍스트가 길어서 작아져야 할 것 같다" 같은 추측으로 임의로 small 로 떨어뜨리지 마라.
+     렌더 단계에서 width fit 이 알아서 폰트를 줄인다. **너의 일은 ref 의 "사이즈 위계" 를 그대로 옮기는 것.**
+   - 예: ref 의 huge 자막이 사용자 컷에서도 huge 여야 한다 (글자 수 무관). large 면 large, medium 이면 medium.
+   - **이 size_level 필드는 빈 값이나 누락 절대 금지. 모든 layer 가 4개 enum 중 하나로 반드시 지정한다.**
+   - matched_ref_layers 가 비어있는 컷에서 새로 만들 때는 ref pattern 의 size_contrast 와 layer_count_typical
+     을 보고 결정. uniform 이면 일관 medium, alternating/dramatic 이면 hook 은 huge/large, fact 는 medium.
+
 5. **자막은 자연스러운 곳에만. 모든 컷에 강제로 넣지 마라.**
    - ref frequency 가 "rare" / "occasional" 면 사용자 컷도 절반 이하만 자막.
    - 자막을 안 넣을 컷은 "layers": [] 로 두라.
@@ -381,8 +538,17 @@ ${cutLines}
    - 예: subject_center_y 가 0.75 인 음식/제품 컷에서 ref 가 bottom 이면 top 으로 옮기는 편이 좋다.
    - 예: subject_center_y 가 0.25 인 얼굴 클로즈업에서 ref 가 top 이면 bottom 으로 옮기는 편이 좋다.
 
-7. **사이즈/색/굵기도 matched_ref_layers 그대로 복사가 기본.**
-   - 변형은 사용자 의도(styleNote) 가 명시할 때만.
+7. **사이즈/색/굵기 + 외곽선/그림자/박스배경/그라데이션/글로우/자간/등장애니메이션도 matched_ref_layers 그대로 복사가 기본.**
+   - matched_ref_layers 의 다음 필드들은 모두 그대로 복사:
+     · outline_color_hex, outline_thickness
+     · has_shadow, shadow_color_hex, shadow_blur
+     · has_background_box, background_color_hex, background_alpha, background_radius
+     · gradient (type / angle / stops 전체. stops 의 color 까지 정확히 같게)
+     · has_glow, glow_color_hex, glow_radius
+     · letter_spacing, entry_animation
+   - **임의로 디자인 값 만들어내지 마라.** ref 와 시각적으로 다르면 매칭의 의미가 사라진다.
+   - matched_ref_layers 가 비어있는 컷에서 자막을 새로 만들 때는 caption_global_style 의 has_outline / outline_color_hex / has_shadow / has_background_box / primary_color_hex 등을 따라가라.
+   - 사용자 styleNote 가 명시적으로 "박스 배경 빼라" 같은 지시를 했을 때만 변형.
 
 ═══════════════════════════════
 [응답 형식]
@@ -405,7 +571,23 @@ JSON 만 출력. 다른 텍스트 금지.
           "font_category": "sans" | "serif" | "handwritten" | "condensed" | "rounded" | "display",
           "font_personality": "modern" | "vintage" | "playful" | "elegant" | "bold_impact" | "minimal" | "retro" | "handwritten_neat" | "handwritten_brush" | "display_decorative",
           "role": "hook" | "fact" | "punchline" | "question" | "cta" | "quote" | "label" | "emphasis" | "decoration",
-          "tone": "casual" | "formal" | "hype" | "poetic" | "informational" | "humorous" | "emotional"
+          "tone": "casual" | "formal" | "hype" | "poetic" | "informational" | "humorous" | "emotional",
+
+          "outline_color_hex": string,
+          "outline_thickness": "none" | "thin" | "medium" | "thick",
+          "has_shadow": boolean,
+          "shadow_color_hex": string,
+          "shadow_blur": number,
+          "has_background_box": boolean,
+          "background_color_hex": string,
+          "background_alpha": number,
+          "background_radius": number,
+          "gradient": { "type": "linear" | "none", "angle": number, "stops": [ { "offset": number, "color": string } ] },
+          "has_glow": boolean,
+          "glow_color_hex": string,
+          "glow_radius": number,
+          "letter_spacing": "tight" | "normal" | "wide",
+          "entry_animation": "none" | "fade"
         }
       ]
     }
@@ -887,4 +1069,57 @@ ${shotsJson}
   · 음식·제품을 테이블 위에서 찍은 경우 보통 (0.5, 0.55)
   · 셀카에서 인물이 화면 오른쪽에 있으면 (0.7, 0.45) 같은 식
 - 절대 JSON 외 텍스트 출력 금지.`;
+}
+
+// ============================================================
+// Stage 1 (긴 소스 축약): 후보 컷들 중에서 30~60초 릴스를 구성할
+// "최종 컷"을 골라 순서까지 정하는 OpenAI 선별 프롬프트.
+// 입력은 이미 (중복 제거 + 품질 필터) 거친 후보들.
+// ============================================================
+export function buildSourceReductionPrompt(args: {
+  candidates: Array<{
+    id: number;
+    video: string;
+    start: number;
+    duration: number;     // 실제 컷으로 쓸 길이 (≤4.5s 로 캡됨)
+    shot_type: string;
+    scene_description: string;
+    spoken_text: string;
+    tags: string[];
+    quality: number;
+  }>;
+  targetSec: number;       // 목표 길이 (예: 45)
+  minSec: number;          // 30
+  maxSec: number;          // 60
+  userDirectionBlock?: string;
+}): string {
+  const list = args.candidates.map(c =>
+    `  {"id":${c.id},"video":"${c.video}","dur":${c.duration.toFixed(2)},"type":"${c.shot_type}",` +
+    `"q":${c.quality.toFixed(2)},"desc":${JSON.stringify(c.scene_description)},` +
+    `"spoken":${JSON.stringify((c.spoken_text || '').slice(0, 120))},"tags":${JSON.stringify((c.tags || []).slice(0, 6))}}`,
+  ).join(',\n');
+
+  const direction = args.userDirectionBlock?.trim()
+    ? `\n[사용자 방향 — 선별·순서에 반영]\n${args.userDirectionBlock.trim()}\n`
+    : '';
+
+  return `너는 숏폼(릴스) 편집 디렉터다.
+긴 원본에서 추출한 "후보 컷" 목록을 준다. 이 중에서 시청 흐름이 좋은 ${args.minSec}~${args.maxSec}초짜리 릴스를 구성할 컷들을 골라 순서까지 정해라.
+${direction}
+[후보 컷] (dur=초, q=품질 0~1, desc/spoken/tags=내용 단서)
+[
+${list}
+]
+
+선별 규칙:
+- 고른 컷들의 dur 합이 ${args.minSec}~${args.maxSec}초가 되게 하라 (목표 ${args.targetSec}초 부근). 절대 ${args.maxSec}초를 넘기지 마라.
+- 비슷하거나 반복되는 장면은 가장 좋은 것 하나만. 다양한 shot_type/장면으로 변주를 줘라.
+- 품질(q)이 낮거나 의미 없는 컷은 버려라. 발화(spoken)나 임팩트가 있는 컷을 우선.
+- 도입(훅) → 전개 → 마무리 흐름이 자연스럽게 순서를 정해라. 영상 간 교차 배치 허용.
+- 반드시 입력에 존재하는 id 만 사용.
+
+아래 JSON 스키마로만 출력. 다른 텍스트/마크다운/코드펜스 금지.
+{
+  "selected": [number]   // 최종 컷 id 들을 "재생 순서대로". 위 규칙을 만족하는 부분집합.
+}`;
 }

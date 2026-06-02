@@ -18,15 +18,25 @@ import path from 'path';
 import {
   ARTIFACTS, appendRawResponse, ensureDir, readJson, readStyleNote, sourcesDir, stageDir, workDir, writeJson,
 } from '../paths';
-import { detectShots, extractAudio, extractFrame, hasAudioStream, probeDuration, runFfmpeg, Shot } from '../ffmpeg';
+import { detectShots, extractAudio, extractAudioRange, extractFrame, hasAudioStream, probeDuration, runFfmpeg, Shot } from '../ffmpeg';
 import { analyzeMultiPartStructured, analyzeVideoStructured, callGeminiTextOnly, MediaPart } from '../gemini';
 import { cosineSim, embedTexts } from '../openai';
 import { buildCaptionPlanningPrompt, buildImageSourceDescriptionPrompt, buildSourceDescriptionPrompt, buildSourceDescriptionPromptMultipart, styleNoteBlock } from '../prompts';
 import { briefToPromptBlock, readStyleBrief } from '../style-brief';
+import { reduceSourceShots, ReduceCandidate } from '../source-reduce';
 import { config } from '../config';
 
 const OUT_W = 1080;
 const OUT_H = 1920;
+
+// ---- 긴 소스 대응 ----
+// 한 소스의 shot 이 이 수를 넘으면 분석을 여러 batch 로 쪼개 호출 (요청총량/출력잘림 회피).
+const SINGLE_CALL_SHOT_MAX = 150;
+const SOURCE_SHOT_BATCH = 120;
+// 전체 추정 출력이 TARGET_MAX_SEC 를 넘으면 큐레이션(reduce) 으로 30~60초로 축약.
+const TARGET_MIN_SEC = 30;
+const TARGET_MAX_SEC = 60;
+const TARGET_SEC = 45;
 
 // 정지 이미지 소스의 기본 cut 길이.
 const IMAGE_CLIP_DURATION_SEC = 3.0;
@@ -152,72 +162,58 @@ export async function runStage1(projectId: string): Promise<{
 
     const duration = await probeDuration(filePath);
     const ffShots: Shot[] = await detectShots(filePath, 0.22);
-
-    const shotsForPrompt = ffShots.map((s, k) => ({
-      index: k, start: s.start, end: s.end,
-    }));
-
-    const { raw, parsed, kind } = await analyzeSourceWithMultipartFallback({
-      projectId,
-      videoId,
-      filePath,
-      ffShots,
-      shotsJsonForPrompt: JSON.stringify(shotsForPrompt, null, 2),
-      styleBlock,
-    });
-    await appendRawResponse(projectId, {
-      stage: 1, kind, video_id: videoId, filename, response: raw,
-    });
-
-    const flashShots: any[] = Array.isArray(parsed?.shots) ? parsed.shots : [];
-    const merged: SourceShot[] = ffShots.map((ff, k) => {
-      const f = flashShots[k] || {};
-      const hs = Number(f.highlight_start);
-      const he = Number(f.highlight_end);
-      const validHighlight = isFinite(hs) && isFinite(he) && he > hs && hs >= ff.start - 0.05 && he <= ff.end + 0.05;
-      const sxRaw = Number(f.subject_center_x);
-      const syRaw = Number(f.subject_center_y);
-      return {
-        video_id: videoId,
-        source_index: k,
-        start: ff.start,
-        end: ff.end,
-        duration: ff.duration,
-        shot_type: String(f.shot_type || 'medium'),
-        subject: String(f.subject || ''),
-        scene_description: String(f.scene_description || ''),
-        tags: Array.isArray(f.tags) ? f.tags.map(String) : [],
-        camera_motion: String(f.camera_motion || 'static'),
-        spoken_text: String(f.spoken_text || ''),
-        quality_score: clamp01(Number(f.quality_score)),
-        highlight_start: validHighlight ? hs : ff.start,
-        highlight_end: validHighlight ? he : Math.min(ff.end, ff.start + Math.min(2.0, ff.duration)),
-        highlight_reason: String(f.highlight_reason || ''),
-        subject_center_x: isFinite(sxRaw) ? clamp01(sxRaw) : 0.5,
-        subject_center_y: isFinite(syRaw) ? clamp01(syRaw) : 0.5,
-      };
-    });
-
+    // shot 이 많으면 batch 로 쪼개 분석 (요청총량/출력잘림 회피). 적으면 단일 호출.
+    const merged = await analyzeSourceMerged({ projectId, videoId, filePath, ffShots, styleBlock, filename });
     return { video_id: videoId, filename, duration, shots: merged, is_image: false };
   }));
   await writeJson(ARTIFACTS.sourceShots(projectId), { videos: sourceVideos });
 
-  // ---- 1c: embedding ----
-  const refTexts = spec.shots.map((s: any) => buildRefEmbedText(s));
-  const srcEntries: { v: SourceVideo; s: SourceShot; text: string }[] = [];
+  // ---- 1c: embedding (source 먼저 — 긴 소스 reduce 가 임베딩을 필요로 함) ----
+  let srcEntries: { v: SourceVideo; s: SourceShot; text: string }[] = [];
   for (const v of sourceVideos) for (const s of v.shots) {
     srcEntries.push({ v, s, text: buildSrcEmbedText(s) });
   }
   if (srcEntries.length === 0) throw new Error('소스 shot 이 비어 있습니다 (Flash 응답 확인 필요)');
 
-  const allTexts = [...refTexts, ...srcEntries.map(e => e.text)];
-  const allVecs = await embedTexts(allTexts);
+  let srcVecs = await embedTexts(srcEntries.map(e => e.text));
+
+  // ---- 1c-bis: 긴 소스 축약 (추정 출력이 TARGET_MAX_SEC 초과일 때만) ----
+  const estimatedSec = srcEntries.reduce(
+    (sum, e) => sum + Math.max(0.05, Math.min(e.s.end - e.s.start, MAX_CUT_DUR)), 0,
+  );
+  if (estimatedSec > TARGET_MAX_SEC) {
+    const userDirectionBlock = styleNote.trim() ? styleNote.trim() : undefined;
+    const cands: ReduceCandidate[] = srcEntries.map(e => ({
+      video_id: e.v.video_id,
+      start: e.s.start,
+      end: e.s.end,
+      quality_score: e.s.quality_score,
+      shot_type: e.s.shot_type,
+      scene_description: e.s.scene_description,
+      spoken_text: e.s.spoken_text,
+      tags: e.s.tags,
+    }));
+    const reduced = await reduceSourceShots(cands, srcVecs, {
+      targetSec: TARGET_SEC, minSec: TARGET_MIN_SEC, maxSec: TARGET_MAX_SEC,
+      maxCutDur: MAX_CUT_DUR, userDirectionBlock,
+    });
+    await appendRawResponse(projectId, {
+      stage: 1, kind: 'source_reduction',
+      input_shots: srcEntries.length, estimated_sec: round3(estimatedSec),
+      method: reduced.method, kept: reduced.keptOrder.length,
+      dedup_removed: reduced.dedupRemoved, result_sec: reduced.estimatedSec,
+    });
+    srcEntries = reduced.keptOrder.map(i => srcEntries[i]);
+    srcVecs = reduced.keptOrder.map(i => srcVecs[i]);
+  }
+
+  // ---- ref embedding ----
+  const refTexts = spec.shots.map((s: any) => buildRefEmbedText(s));
+  const refVecs = await embedTexts(refTexts);
   await appendRawResponse(projectId, {
     stage: 1, kind: 'openai_embeddings',
-    count: allTexts.length, model: config.OPENAI_EMBEDDING_MODEL,
+    count: refTexts.length + srcEntries.length, model: config.OPENAI_EMBEDDING_MODEL,
   });
-  const refVecs = allVecs.slice(0, refTexts.length);
-  const srcVecs = allVecs.slice(refTexts.length);
 
   // ---- 1d: 각 source shot 마다 가장 잘 어울리는 ref shot 의 STYLE 을 빌려온다 ----
   // (ref 는 재사용 OK — 스타일은 여러 source 에 적용 가능. source 는 한 번씩만 사용.)
@@ -314,6 +310,93 @@ export async function runStage1(projectId: string): Promise<{
 // 폴백 사다리:
 //   multipart Flash → multipart Pro → 풀 영상 Pro → 로컬 기본값
 // ============================================================
+// ============================================================
+// 소스 분석 진입점: shot 수가 많으면 batch 로 쪼개 호출하고 합친다.
+// (batch 모드는 audio 도 구간만 잘라 보내고, 풀영상 폴백은 끄고 로컬 폴백만 — 인덱스 정합 보장)
+// ============================================================
+async function analyzeSourceMerged(args: {
+  projectId: string;
+  videoId: string;
+  filePath: string;
+  ffShots: Shot[];
+  styleBlock: string;
+  filename: string;
+}): Promise<SourceShot[]> {
+  const { ffShots } = args;
+  if (ffShots.length <= SINGLE_CALL_SHOT_MAX) {
+    return analyzeOneBatch({ ...args, batchShots: ffShots, globalOffset: 0, batched: false });
+  }
+  const out: SourceShot[] = [];
+  for (let b = 0; b < ffShots.length; b += SOURCE_SHOT_BATCH) {
+    const batchShots = ffShots.slice(b, b + SOURCE_SHOT_BATCH);
+    const merged = await analyzeOneBatch({ ...args, batchShots, globalOffset: b, batched: true });
+    out.push(...merged);
+  }
+  return out;
+}
+
+async function analyzeOneBatch(args: {
+  projectId: string;
+  videoId: string;
+  filePath: string;
+  batchShots: Shot[];
+  globalOffset: number;
+  styleBlock: string;
+  filename: string;
+  batched: boolean;
+}): Promise<SourceShot[]> {
+  const { projectId, videoId, filePath, batchShots, globalOffset, styleBlock, filename, batched } = args;
+
+  // batch-로컬 인덱스로 프롬프트 작성 (응답은 위치 기준으로 매핑)
+  const shotsForPrompt = batchShots.map((s, k) => ({ index: k, start: s.start, end: s.end }));
+  const audioRange = batched && batchShots.length > 0
+    ? { start: batchShots[0].start, end: batchShots[batchShots.length - 1].end }
+    : undefined;
+
+  const { raw, parsed, kind } = await analyzeSourceWithMultipartFallback({
+    projectId, videoId, filePath,
+    ffShots: batchShots,
+    shotsJsonForPrompt: JSON.stringify(shotsForPrompt, null, 2),
+    styleBlock,
+    audioRange,
+    allowFullVideoFallback: !batched,   // batch 모드는 풀영상 폴백 끔 (인덱스 어긋남 방지)
+  });
+  await appendRawResponse(projectId, {
+    stage: 1, kind, video_id: videoId, filename,
+    batched, batch_offset: globalOffset, batch_size: batchShots.length,
+    response: raw,
+  });
+
+  const flashShots: any[] = Array.isArray(parsed?.shots) ? parsed.shots : [];
+  return batchShots.map((ff, k) => {
+    const f = flashShots[k] || {};
+    const hs = Number(f.highlight_start);
+    const he = Number(f.highlight_end);
+    const validHighlight = isFinite(hs) && isFinite(he) && he > hs && hs >= ff.start - 0.05 && he <= ff.end + 0.05;
+    const sxRaw = Number(f.subject_center_x);
+    const syRaw = Number(f.subject_center_y);
+    return {
+      video_id: videoId,
+      source_index: globalOffset + k,
+      start: ff.start,
+      end: ff.end,
+      duration: ff.duration,
+      shot_type: String(f.shot_type || 'medium'),
+      subject: String(f.subject || ''),
+      scene_description: String(f.scene_description || ''),
+      tags: Array.isArray(f.tags) ? f.tags.map(String) : [],
+      camera_motion: String(f.camera_motion || 'static'),
+      spoken_text: String(f.spoken_text || ''),
+      quality_score: clamp01(Number(f.quality_score)),
+      highlight_start: validHighlight ? hs : ff.start,
+      highlight_end: validHighlight ? he : Math.min(ff.end, ff.start + Math.min(2.0, ff.duration)),
+      highlight_reason: String(f.highlight_reason || ''),
+      subject_center_x: isFinite(sxRaw) ? clamp01(sxRaw) : 0.5,
+      subject_center_y: isFinite(syRaw) ? clamp01(syRaw) : 0.5,
+    };
+  });
+}
+
 async function analyzeSourceWithMultipartFallback(args: {
   projectId: string;
   videoId: string;
@@ -321,13 +404,22 @@ async function analyzeSourceWithMultipartFallback(args: {
   ffShots: Shot[];
   shotsJsonForPrompt: string;
   styleBlock: string;
+  audioRange?: { start: number; end: number };
+  allowFullVideoFallback?: boolean;
 }): Promise<{ raw: any; parsed: any; kind: string }> {
-  const { projectId, videoId, filePath, ffShots, shotsJsonForPrompt, styleBlock } = args;
+  const { projectId, videoId, filePath, ffShots, shotsJsonForPrompt, styleBlock, audioRange } = args;
+  const allowFullVideoFallback = args.allowFullVideoFallback !== false;
+
+  // 폴백: 풀영상 허용이면 풀영상 Pro → 로컬, 아니면 곧장 로컬.
+  const doFallback = (reason: string): Promise<{ raw: any; parsed: any; kind: string }> =>
+    allowFullVideoFallback
+      ? fallbackToFullVideo({ filePath, ffShots, styleBlock, shotsJsonForPrompt, reason })
+      : Promise.resolve(localFallback(ffShots, reason));
 
   // 1) 매체 추출 (work 디렉토리에 임시 저장)
   const work = workDir(projectId);
   await ensureDir(work);
-  const tmpRoot = path.join(work, `_analyze_${videoId}`);
+  const tmpRoot = path.join(work, `_analyze_${videoId}_${audioRange ? Math.round(audioRange.start) : 'all'}`);
   await ensureDir(tmpRoot);
 
   let frames: string[] = [];
@@ -338,21 +430,18 @@ async function analyzeSourceWithMultipartFallback(args: {
     if (audible) {
       const audioOut = path.join(tmpRoot, 'audio.mp3');
       try {
-        await extractAudio(filePath, audioOut);
+        if (audioRange) {
+          await extractAudioRange(filePath, audioRange.start, audioRange.end - audioRange.start, audioOut);
+        } else {
+          await extractAudio(filePath, audioOut);
+        }
         audioPath = audioOut;
       } catch {
         audioPath = null; // 오디오 추출 실패해도 분석은 계속.
       }
     }
   } catch (extractErr: any) {
-    // 미디어 추출이 통째로 실패하면 풀 영상 폴백으로 넘어간다.
-    return fallbackToFullVideo({
-      filePath,
-      ffShots,
-      styleBlock,
-      shotsJsonForPrompt,
-      reason: `media_extract_failed: ${extractErr?.message || String(extractErr)}`,
-    });
+    return doFallback(`media_extract_failed: ${extractErr?.message || String(extractErr)}`);
   }
 
   const promptMulti = styleBlock + buildSourceDescriptionPromptMultipart({
@@ -373,11 +462,7 @@ async function analyzeSourceWithMultipartFallback(args: {
   } catch (flashErr: any) {
     const flashError = flashErr?.message || String(flashErr);
     if (!isRetryableGeminiError(flashError)) {
-      // retryable 이 아닌 에러여도 풀 영상으로 한번 시도.
-      return fallbackToFullVideo({
-        filePath, ffShots, styleBlock, shotsJsonForPrompt,
-        reason: `multipart_flash_fatal: ${flashError.slice(0, 300)}`,
-      });
+      return doFallback(`multipart_flash_fatal: ${flashError.slice(0, 300)}`);
     }
 
     // 3) Pro 멀티파트
@@ -393,13 +478,18 @@ async function analyzeSourceWithMultipartFallback(args: {
       };
     } catch (proErr: any) {
       const proError = proErr?.message || String(proErr);
-      // 4) 풀 영상 폴백
-      return fallbackToFullVideo({
-        filePath, ffShots, styleBlock, shotsJsonForPrompt,
-        reason: `multipart_failed flash=${flashError.slice(0, 200)} pro=${proError.slice(0, 200)}`,
-      });
+      return doFallback(`multipart_failed flash=${flashError.slice(0, 200)} pro=${proError.slice(0, 200)}`);
     }
   }
+}
+
+// 로컬 폴백 결과 (Gemini 없이 FFmpeg shot 경계만으로 기본 묘사).
+function localFallback(ffShots: Shot[], reason: string): { raw: any; parsed: any; kind: string } {
+  return {
+    raw: { fallback: true, fallback_reason: reason },
+    parsed: fallbackSourceDescription(ffShots),
+    kind: 'local_source_description_fallback',
+  };
 }
 
 // ============================================================
@@ -483,16 +573,26 @@ async function analyzeImageSource(args: {
 }
 
 // shot 별로 대표 프레임 1장 (시작+50% 지점) 을 jpg 로 추출.
+// shot 대표 프레임(중앙)을 제한된 동시성으로 병렬 추출.
+// 프레임당 fast-seek 라 가벼워서, 순차보다 wall-clock 이 줄어든다.
+// (소스들도 이미 병렬 처리되므로 동시성은 3 으로 보수적으로 둠.)
+const FRAME_EXTRACT_CONCURRENCY = 3;
+
 async function extractShotFrames(filePath: string, shots: Shot[], outDir: string): Promise<string[]> {
-  const frames: string[] = [];
-  for (let k = 0; k < shots.length; k++) {
-    const s = shots[k];
-    const mid = s.start + (s.end - s.start) / 2;
-    const outPath = path.join(outDir, `shot_${String(k).padStart(4, '0')}.jpg`);
-    await extractFrame(filePath, mid, outPath);
-    frames.push(outPath);
-  }
-  return frames;
+  const outPaths = shots.map((_, k) => path.join(outDir, `shot_${String(k).padStart(4, '0')}.jpg`));
+  let next = 0;
+  const worker = async () => {
+    while (true) {
+      const k = next++;                       // 단일스레드 이벤트루프라 원자적
+      if (k >= shots.length) return;
+      const s = shots[k];
+      const mid = s.start + (s.end - s.start) / 2;
+      await extractFrame(filePath, mid, outPaths[k]);
+    }
+  };
+  const lanes = Math.min(FRAME_EXTRACT_CONCURRENCY, Math.max(1, shots.length));
+  await Promise.all(Array.from({ length: lanes }, () => worker()));
+  return outPaths;
 }
 
 async function fallbackToFullVideo(args: {

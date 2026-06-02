@@ -15,14 +15,22 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { ARTIFACTS, appendRawResponse, bgmDir, ensureDir, readJson, stageDir } from '../paths';
+import { ARTIFACTS, appendRawResponse, bgmDir, ensureDir, readJson, referenceDir, stageDir, writeJson } from '../paths';
 import { probeDuration, runFfmpeg } from '../ffmpeg';
 import { fetchBgmFromArchive } from '../archive';
+import { archiveHintsFromIdentity, BgmIdentifyResult, identifyReferenceBgm } from '../bgm-identify';
 import { readTtsConfig } from '../tts-config';
 import { readTtsOutline, validateOutline, writeTtsOutline } from '../tts-outline';
 import { DEFAULT_VOICE, synthesizeTtsToWav } from '../tts';
 
-const BGM_VOLUME = 0.65;                  // 평소 BGM 볼륨 (sidechain 으로 발화 시 더 줄어듦)
+// BGM 볼륨: TTS 가 있을 때는 BGM 을 매우 작게 깔아서 TTS 우선 보장.
+// 추가로 sidechain ducking 이 발화 중에 더 줄여줌 (release 180ms 로 빠르게 복귀).
+const BGM_VOLUME_NO_TTS = 0.55;           // 원본 voice 또는 voice 없는 모드
+const BGM_VOLUME_WITH_TTS = 0.13;         // TTS 가 메인 음성일 때 BGM 깔개 (sidechain ducking 별도)
+const TTS_VOLUME_BOOST = 1.30;            // TTS 자체 볼륨 부스트 (loudnorm 전, BGM 대비 명확히)
+// 각 TTS segment 의 음량 일정화 — Gemini TTS preview 가 segment 마다 음량이 들쭉날쭉이라
+// dynaudnorm 으로 frame 단위 평준화. p=0.9 / m=8 정도가 음성에 자연스러움.
+const TTS_DYNAUDNORM = 'dynaudnorm=f=500:g=15:p=0.9:m=8';
 const LOUDNORM = 'loudnorm=I=-14:TP=-1.5:LRA=11';
 
 type AudioProfile = {
@@ -32,6 +40,7 @@ type AudioProfile = {
   bgm_tempo?: string;
   bgm_energy?: string;
   bgm_instruments?: string[];
+  extra_terms?: string[];
 };
 
 type TtsLayer = { start: number; path: string; duration: number; atempo: number; slotDuration: number };
@@ -40,6 +49,11 @@ export async function runStage4(projectId: string): Promise<{
   ok: true;
   mode: 'voice_only' | 'bgm_mixed' | 'tts_only' | 'tts_bgm_mixed';
   bgm?: { source: 'uploaded' | 'archive'; title?: string; identifier?: string; query_used?: string };
+  reference_bgm?: {
+    status: 'no_token' | 'no_match' | 'matched' | 'error';
+    title?: string; artist?: string; album?: string; release_date?: string;
+    genres?: string[]; song_link?: string; spotify_url?: string; apple_url?: string;
+  };
   tts?: { voice: string; layers: number; corrections: number };
   noise_muted_ranges: number;        // 노이즈로 판단되어 mute 한 컷 수
 }> {
@@ -71,6 +85,7 @@ export async function runStage4(projectId: string): Promise<{
   let bgms: string[] = [];
   let bgmSource: 'uploaded' | 'archive' = 'uploaded';
   let archiveMeta: { title?: string; identifier?: string; query_used?: string } | undefined;
+  let refBgm: BgmIdentifyResult | undefined;
   const spec: any = await readJson(ARTIFACTS.editSpec(projectId));
   const audioProfile: AudioProfile = spec?.audio_profile || {};
 
@@ -82,6 +97,28 @@ export async function runStage4(projectId: string): Promise<{
     if (audioProfile.has_bgm === false) {
       bgms = [];
     } else {
+      // ---- (선택) 레퍼런스 실제 BGM 지문인식 → 무료트랙 매칭 가이드 ----
+      // AUDD_API_TOKEN 이 있을 때만 동작. 식별돼도 상용곡은 임베드하지 않고,
+      // 장르/시대 힌트만 Internet Archive 검색(extra_terms)에 흘린다.
+      refBgm = await identifyReferenceBgmSafe(projectId);
+      if (refBgm?.status === 'matched' && refBgm.identity) {
+        const hints = archiveHintsFromIdentity(refBgm.identity);
+        if (hints.extra_terms.length > 0) {
+          audioProfile.extra_terms = hints.extra_terms;
+          if (!audioProfile.bgm_genre && hints.genre) audioProfile.bgm_genre = hints.genre;
+        }
+        await writeJson(ARTIFACTS.bgmIdentity(projectId), refBgm.identity);
+        await appendRawResponse(projectId, {
+          stage: 4, kind: 'reference_bgm_identified',
+          identity: refBgm.identity, archive_hints: hints,
+        });
+      } else if (refBgm && refBgm.status !== 'no_token') {
+        await appendRawResponse(projectId, {
+          stage: 4, kind: 'reference_bgm_identify_skipped',
+          status: refBgm.status, error: refBgm.error,
+        });
+      }
+
       try {
         const fetched = await fetchBgmFromArchive(audioProfile, bgmDir(projectId));
         await appendRawResponse(projectId, {
@@ -180,7 +217,7 @@ export async function runStage4(projectId: string): Promise<{
   await appendRawResponse(projectId, {
     stage: 4, kind: 'audio_plan',
     noise_muted_ranges: noiseRanges.length, ranges: noiseRanges,
-    bgm_source: hasBgm ? bgmSource : 'none', bgm_volume: BGM_VOLUME,
+    bgm_source: hasBgm ? bgmSource : 'none', bgm_volume: hasTts ? BGM_VOLUME_WITH_TTS : BGM_VOLUME_NO_TTS,
     tts_enabled: ttsConfig.enabled, tts_mode: ttsConfig.mode,
     tts_layers: ttsLayers.length,
   });
@@ -222,8 +259,10 @@ export async function runStage4(projectId: string): Promise<{
     parts.push(`[0:a]anull[srcA]`);
   }
 
-  // 2) TTS layer 들 → atempo 보정 + adelay 배치 → ttsLabel 하나로 모음.
+  // 2) TTS layer 들 → atempo 보정 + dynaudnorm (segment 음량 일정화) + volume 부스트 + adelay 배치 → ttsLabel 하나로 모음.
   //    atempo 는 0.5~2.0 범위에서 한 번에 적용 가능.
+  //    dynaudnorm 으로 Gemini TTS preview 의 segment 간 음량 차이를 평준화 → 일관된 들림.
+  //    volume 부스트는 BGM 대비 명확히 들리도록 (loudnorm 이 마지막에 전체 평준화).
   let ttsLabel = '';
   if (hasTts && ttsInputStart !== null) {
     for (let i = 0; i < ttsLayers.length; i++) {
@@ -232,8 +271,9 @@ export async function runStage4(projectId: string): Promise<{
       const idx = ttsInputStart + i;
       const chain: string[] = [];
       if (tl.atempo > 1.01) chain.push(`atempo=${tl.atempo.toFixed(3)}`);
+      chain.push(TTS_DYNAUDNORM);
+      chain.push(`volume=${TTS_VOLUME_BOOST.toFixed(2)}`);
       if (startMs > 0) chain.push(`adelay=${startMs}|${startMs}`);
-      if (chain.length === 0) chain.push('anull');
       parts.push(`[${idx}:a]${chain.join(',')}[tts${i}]`);
     }
     if (ttsLayers.length === 1) {
@@ -246,15 +286,18 @@ export async function runStage4(projectId: string): Promise<{
   }
 
   // 3) BGM 처리 + sidechain ducking
+  //    TTS 모드에서는 BGM 자체 볼륨을 더 작게 깔고, sidechain 도 더 공격적으로 작동.
   if (hasBgm && bgmInputIdx !== null) {
+    const bgmVol = hasTts ? BGM_VOLUME_WITH_TTS : BGM_VOLUME_NO_TTS;
     parts.push(
       `[${bgmInputIdx}:a]atrim=start=${bgmStart.toFixed(3)},asetpts=PTS-STARTPTS,` +
-      `aloop=loop=-1:size=2e9,atrim=duration=${videoDur.toFixed(3)},volume=${BGM_VOLUME}[bgm0]`
+      `aloop=loop=-1:size=2e9,atrim=duration=${videoDur.toFixed(3)},volume=${bgmVol.toFixed(2)}[bgm0]`
     );
     if (hasTts) {
-      // TTS 가 BGM 의 ducking trigger
+      // TTS 가 BGM 의 ducking trigger. ratio 15 로 발화 중 BGM 깊게 누르고,
+      // release 180ms 로 발화 끝나면 빠르게 복귀해서 BGM 이 끊김 없이 흐름.
       parts.push(`${ttsLabel}asplit=2[ttsMix][ttsTrig]`);
-      parts.push(`[bgm0][ttsTrig]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=300[bgmDuck]`);
+      parts.push(`[bgm0][ttsTrig]sidechaincompress=threshold=0.03:ratio=15:attack=4:release=180[bgmDuck]`);
     } else {
       // 원본 voice 가 trigger (기존 동작)
       parts.push(`[srcA]asplit=2[srcMix][srcTrig]`);
@@ -295,6 +338,19 @@ export async function runStage4(projectId: string): Promise<{
     ok: true,
     mode,
     bgm: hasBgm ? { source: bgmSource, ...archiveMeta } : undefined,
+    reference_bgm: refBgm && refBgm.status !== 'no_token'
+      ? {
+          status: refBgm.status,
+          title: refBgm.identity?.title,
+          artist: refBgm.identity?.artist,
+          album: refBgm.identity?.album,
+          release_date: refBgm.identity?.release_date,
+          genres: refBgm.identity?.genres,
+          song_link: refBgm.identity?.song_link,
+          spotify_url: refBgm.identity?.spotify_url,
+          apple_url: refBgm.identity?.apple_url,
+        }
+      : undefined,
     tts: hasTts ? {
       voice: ttsConfig.voice || DEFAULT_VOICE,
       layers: ttsLayers.length,
@@ -390,6 +446,19 @@ async function listBgmFiles(projectId: string): Promise<string[]> {
     return files.filter(f => !f.startsWith('.')).map(f => path.join(dir, f));
   } catch {
     return [];
+  }
+}
+
+// 레퍼런스 영상에서 실제 BGM 을 지문인식. 토큰 없거나 실패해도 파이프라인을 막지 않는다.
+async function identifyReferenceBgmSafe(projectId: string): Promise<BgmIdentifyResult> {
+  try {
+    const dir = referenceDir(projectId);
+    const files = (await fs.readdir(dir).catch(() => [])).filter(f => !f.startsWith('.'));
+    if (files.length === 0) return { status: 'error', error: '레퍼런스 영상 없음' };
+    const refFile = path.join(dir, files[0]);
+    return await identifyReferenceBgm(refFile, path.join(stageDir(projectId, 4), 'tmp'));
+  } catch (e: any) {
+    return { status: 'error', error: e?.message || String(e) };
   }
 }
 

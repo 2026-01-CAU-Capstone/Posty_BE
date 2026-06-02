@@ -66,6 +66,7 @@ export const ARTIFACTS = {
   captionsAss: (pid: string) => path.join(stageDir(pid, 3), 'captions.ass'),
   captionedMp4: (pid: string) => path.join(stageDir(pid, 3), 'captioned.mp4'),
   finalMp4: (pid: string) => path.join(stageDir(pid, 4), 'final.mp4'),
+  bgmIdentity: (pid: string) => path.join(stageDir(pid, 4), 'bgm-identity.json'),
   ttsConfig: (pid: string) => path.join(projectDir(pid), 'tts-config.json'),
   ttsOutline: (pid: string) => path.join(projectDir(pid), 'tts-outline.json'),
   ttsAudioDir: (pid: string) => path.join(stageDir(pid, 4), 'tts'),
