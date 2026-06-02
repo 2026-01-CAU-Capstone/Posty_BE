@@ -19,8 +19,9 @@ export type Estimate = {
   total14: number;       // 생성 단계 (Stage 1~4)
 };
 
-// 보수 계수 — 과대 추정 (실측보다 넉넉하게).
-const SAFETY = 1.15;
+// 보수 계수 — 과대 추정 (실측보다 충분히 넉넉하게).
+// "예상보다 빨리 끝났네!" 가 "왜 이렇게 오래 걸려?" 보다 UX 가 훨씬 좋아서 의도적으로 크게 잡는다.
+const SAFETY = 1.6;
 
 async function dirDuration(dir: string): Promise<{ total: number; count: number }> {
   const files = (await fsp.readdir(dir).catch(() => [])).filter(f => !f.startsWith('.'));
@@ -34,11 +35,13 @@ export function computeEstimate(refDur: number, srcDur: number, nSources: number
   const outDurEst = Math.max(8, Math.min(srcDur || 0, 75));
   const up = (x: number) => Math.ceil(x * SAFETY);
 
-  const s0 = up(75 + 1.2 * refDur);            // 레퍼런스 분석 (Pro 2패스 업로드)
-  const s1 = up(25 + 3.0 * srcDur + 12 * nSources); // 디코드 + Gemini(소스별) + 렌더
-  const s2 = up(12 + 1.5 * outDurEst);         // 색보정
-  const s3 = up(12 + 1.2 * outDurEst);         // 자막 (libass)
-  const s4 = up(35 + 1.8 * outDurEst);         // BGM 다운로드(네트워크) + 믹스
+  // 기본값을 보수적으로 (실측의 worst-case 에 가깝게).
+  // 큰 영상/소스가 많을수록 실측 변동성이 커지므로 srcDur·nSources 계수도 키운다.
+  const s0 = up(90  + 1.6 * refDur);                  // 레퍼런스 분석 (Pro 2패스 업로드 + 텍스트 OCR)
+  const s1 = up(40  + 4.0 * srcDur + 18 * nSources);  // 디코드 + Gemini 소스별 + 렌더
+  const s2 = up(20  + 2.0 * outDurEst);               // 색보정
+  const s3 = up(20  + 1.6 * outDurEst);               // 자막 (libass)
+  const s4 = up(50  + 2.4 * outDurEst);               // BGM 다운로드(네트워크) + 믹스
 
   const perStage = [s0, s1, s2, s3, s4];
   return {

@@ -253,6 +253,25 @@ app.post('/api/run', async (c) => {
   return c.json({ ok: true, jobId: job.id });
 });
 
+// ---- 진행/디버그용 raw API 응답 ----
+// raw-api-responses.json 의 누적 entries 를 그대로 반환.
+// 각 entry 가 클 수 있으므로 limit 쿼리로 마지막 N개만 받을 수 있게 함 (기본 200).
+app.get('/api/raw-responses', async (c) => {
+  const projectId = c.req.query('projectId') || '';
+  if (!projectId) return c.json({ error: 'projectId 누락' }, 400);
+  try { await fsp.access(projectDir(projectId)); } catch { return c.json({ error: 'project 가 존재하지 않습니다' }, 404); }
+  const limit = Math.max(1, Math.min(2000, Number(c.req.query('limit')) || 200));
+  const p = ARTIFACTS.rawResponses(projectId);
+  let arr: any[] = [];
+  try {
+    const t = await fsp.readFile(p, 'utf-8');
+    arr = JSON.parse(t);
+    if (!Array.isArray(arr)) arr = [];
+  } catch { arr = []; }
+  const sliced = arr.slice(-limit);
+  return c.json({ ok: true, total: arr.length, returned: sliced.length, entries: sliced });
+});
+
 // ---- 처리 시간 예상 (보수적) ----
 app.get('/api/estimate', async (c) => {
   const projectId = c.req.query('projectId') || '';
