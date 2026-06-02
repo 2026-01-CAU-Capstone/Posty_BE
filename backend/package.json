@@ -1,0 +1,22 @@
+{
+  "name": "posty-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Posty 파이프라인 독립 API 서버 (Hono). lib/* 파이프라인 재사용 + in-process 작업 큐.",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "dotenv": "^16.4.7",
+    "hono": "^4.6.14"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.0"
+  }
+}
