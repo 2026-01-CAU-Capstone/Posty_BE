@@ -113,6 +113,9 @@ s4 = 50  + 2.4 * outDurEst               // BGM 다운로드 + 믹스
 2. `analyzeVideoStructured()` 2차 — 텍스트 전용 (한글 OCR 보강). `mergeTextFocusedIntoSpec()`로 `shots[].caption_layers` / `caption_pattern` 덮어쓰기.
 3. `normalizeShot()` — index/start/end/duration/shot_type/subject/scene_description/composition/camera_motion/transition_to_next/caption_layers/required_tags 정규화.
 4. `normalizeLayer()` — text가 빈 layer도 보존 (스타일 정보용). position·align·size·color·emphasis·italic·font_category·font_personality·role·tone.
+5. **`stripWatermarkLayers()` — 워터마크/지속 오버레이 제거 (근본 차단).** 출처 핸들·계정명·워터마크·구독 안내처럼 영상 콘텐츠가 아니라 운영용으로 고정된 텍스트를 `shots[].caption_layers` 에서 통째로 제거. caption planning 의 LLM 판단에만 맡기지 않고 spec 단계에서 차단. 제거 시 `raw-api-responses.json` 에 `kind: "watermark_stripped"` 기록.
+   - 판정 3신호: (1) 키워드 (`@handle`, URL, `출처`/`credit`, `follow`/`subscribe`/`구독`/`팔로우`, `#해시태그` 단독) (2) **코너(top\|bottom + left\|right) + (작은 크기 \| label/decoration 역할)** — 전형적 워터마크 위치 (3) 거의 모든 컷에 동일 텍스트 반복 + 형태 신호 + 박스 없음 → 지속 오버레이
+   - 보존: 중앙·큰 글씨·박스 배경 hook 은 가게명이 들어가도 콘텐츠로 보고 유지 (반복만으로는 제거 안 함)
 
 **스펙 스키마 (edit-spec.json):**
 ```ts
@@ -367,7 +370,11 @@ ref (레퍼런스) → sources (소스) → waiting (분석 대기) → options 
 
 ### 5.5 Posty 컴포넌트 ([frontend/src/Posty.tsx](frontend/src/Posty.tsx))
 
-곰돌이 마스코트 SVG. `working` prop으로 분석/생성 중 애니메이션. 말풍선 옆에 두는 작은 사이즈 (28~46px) 부터 대기 화면의 큰 사이즈 (96px) 까지 사용.
+**쿼카(quokka) 마스코트** SVG (인라인, 오리지널). `variant` prop 으로 두 모습:
+- `variant="logo"` — 헤더 로고. **포스트잇을 오물오물 씹는** 쿼카 (입 + 포스트잇 `posty-chew` 애니메이션 + 부스러기 떨어짐)
+- `variant="detective"` (기본) — **돋보기 든 쿼카**. 분석 대기 / 영상 생성 화면. `working=true` 면 돋보기 스캔 애니메이션
+
+`working` prop 으로 분석/생성 중 애니메이션. 말풍선 옆 작은 사이즈(28~46px)부터 대기 화면 큰 사이즈(96px)까지 사용.
 
 ---
 
@@ -378,7 +385,7 @@ ref (레퍼런스) → sources (소스) → waiting (분석 대기) → options 
 | [paths.ts](lib/paths.ts) | `data/projects/{pid}/` 전체 경로 + `ARTIFACTS` 상수 + JSON read/write + `appendRawResponse()` (모든 API 응답을 `raw-api-responses.json` 에 누적) |
 | [style-suggest.ts](lib/style-suggest.ts) | **Stage 0.5** — `generateStyleSuggest(projectId)` / `readStyleSuggest()`. edit-spec.json 요약 → **OpenAI `gpt-4o-mini` (`response_format: json_object`)** → `style-suggest.json` 캐시. 정규화 (enum 검증, 배열/문자열 길이 제한) |
 | [config.ts](lib/config.ts) | API 키, 모델명, FFmpeg 경로, hwaccel 옵션. `checkStageConfig()` 로 stage별 필수 키 검증 |
-| [ffmpeg.ts](lib/ffmpeg.ts) | spawn 기반 ffmpeg/ffprobe 래퍼 + `probeDuration` `probeMetadata` `detectShots` `hasAudioStream` `extractFrame` `extractAudio[Range]` `measureSignalStats` |
+| [ffmpeg.ts](lib/ffmpeg.ts) | spawn 기반 ffmpeg/ffprobe 래퍼 + `probeDuration` `probeMetadata` `detectShots` `hasAudioStream` `extractFrame` `extractAudio[Range]` `measureSignalStats`. **`FFMPEG_VERBOSE=1`** 이면 각 ffmpeg 명령/진행률(stderr)/exit code+소요시간을 backend stdout 에 실시간 출력 (hang 디버깅용) |
 | [gemini.ts](lib/gemini.ts) | `analyzeVideoStructured` (단일 영상), `analyzeMultiPartStructured` (멀티미디어), `callGeminiTextOnly`. 18MB 초과는 Files API resumable upload로 자동 전환. 429/5xx 재시도 |
 | [openai.ts](lib/openai.ts) | `embedTexts` (text-embedding-3-small, batch=256), `chatJson` (gpt-4o-mini, JSON 모드), `cosineSim` |
 | [prompts.ts](lib/prompts.ts) | 모든 LLM 프롬프트 한 파일 (`REFERENCE_ANALYSIS_PROMPT`, `REFERENCE_TEXT_FOCUSED_PROMPT`, `buildSourceDescriptionPrompt[Multipart]`, `buildImageSourceDescriptionPrompt`, `buildCaptionPlanningPrompt`, `buildSourceReductionPrompt`, `styleNoteBlock`) |
@@ -482,7 +489,8 @@ style-suggest.json              Stage 0.5 — 마스코트 한 줄 요약 + 옵�
 | Windows 경로 escaping (드라이브 콜론) | Stage 3 ffmpeg cwd=stage3 → 상대 forward-slash 경로로 fontsdir·.ass 지정 |
 | Gemini thinking 모델의 응답 잘림 (Stage 0.5) | OpenAI `gpt-4o-mini` + `response_format=json_object` 로 회피. (Gemini 2.5 Flash 의 maxOutputTokens 1K~2K 는 thinking 만 하다 끝남) |
 | caption_planning 이 ref size 위계를 평탄화 | 프롬프트 4-bis "size_level 그대로 카피" + caption-ass 가 LLM size_level 우선 사용 (autoSizeLevel 덮어쓰기 제거) |
-| ref 메타 자막(출처/광고/워터마크/음악정보) 가 사용자 영상에 새겨짐 | caption planning 프롬프트의 6개 패턴 무시 정책 |
+| ref 메타 자막(출처/광고/워터마크/음악정보) 가 사용자 영상에 새겨짐 | **(1차) Stage 0 `stripWatermarkLayers()` 가 spec 단계에서 원천 제거** + (2차) caption planning 프롬프트의 6개 패턴 무시 정책 |
+| ffmpeg hang 디버깅 불가 (stderr 가 버퍼에만 쌓임) | `FFMPEG_VERBOSE=1` 로 명령/진행률/exit 실시간 출력 |
 | ref 와 자막 폰트 인상 불일치 | `pickBundledFont` 첫 폰트 고정 (영상 내 일관성) + bold+heavy personality 에 family 단위 굵기 |
 | huge 자막의 외곽선이 가늘게 보임 | 외곽선/그림자/박스 padding 을 px 고정 → fontSize 비율로 변경 |
 | BGM intro 무음 | 7~9개 후보 윈도우의 `volumedetect` mean/max로 best start offset |
@@ -529,6 +537,7 @@ OPENAI_CHAT_MODEL=gpt-4o-mini   # 긴 소스 축약
 AUDD_API_TOKEN=                 # 선택 — 레퍼런스 BGM 지문인식
 FFMPEG_HWACCEL=                 # 선택 — d3d11va 등 (노트북 깜빡임 주의)
 FFMPEG_SCENE_SKIP_NONREF=       # 선택 — '1' 이면 B프레임 디코드 생략
+FFMPEG_VERBOSE=                 # 선택 — '1' 이면 ffmpeg 명령/진행률을 콘솔에 실시간 출력 (hang 디버깅)
 BACKEND_PORT=8787
 WORKER_CONCURRENCY=1            # ffmpeg CPU 폭주 방지
 ```
