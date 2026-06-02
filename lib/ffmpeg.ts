@@ -17,8 +17,22 @@ export async function runFfprobe(args: string[]): Promise<{ stdout: string; stde
   return runBinary(config.FFPROBE_PATH, args);
 }
 
+// 디버깅용 — env FFMPEG_VERBOSE=1 이면 명령/진행률을 backend stdout 에 실시간 흘림.
+// ffmpeg 의 stderr 에는 `frame=NN fps=NN time=00:00:04.0 ...` 진행률이 1초마다
+// 갱신되므로, 켜두면 어디서 hang 인지 / 어느 segment 에서 느린지 즉시 보인다.
+function ffmpegVerbose(): boolean {
+  return process.env.FFMPEG_VERBOSE === '1' || process.env.FFMPEG_VERBOSE === 'true';
+}
+
 function runBinary(bin: string, args: string[], cwd?: string): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
+    const verbose = ffmpegVerbose();
+    const t0 = Date.now();
+    if (verbose) {
+      const shortBin = bin.split(/[\\/]/).pop() || bin;
+      console.log(`\n[ffmpeg] $ ${shortBin} ${args.join(' ')}${cwd ? `   (cwd=${cwd})` : ''}`);
+    }
+
     let proc;
     try {
       proc = spawn(bin, args, { cwd });
@@ -27,8 +41,15 @@ function runBinary(bin: string, args: string[], cwd?: string): Promise<{ stdout:
     }
     let stdout = '';
     let stderr = '';
-    proc.stdout.on('data', d => { stdout += d.toString(); });
-    proc.stderr.on('data', d => { stderr += d.toString(); });
+    proc.stdout.on('data', d => {
+      stdout += d.toString();
+      if (verbose) process.stdout.write(d);
+    });
+    proc.stderr.on('data', d => {
+      stderr += d.toString();
+      // ffmpeg 진행 보고가 여기로 옴 → verbose 모드에서 실시간 흘리기
+      if (verbose) process.stderr.write(d);
+    });
     proc.on('error', (err: any) => {
       if (err.code === 'ENOENT') {
         reject(new Error(`${bin} 을(를) 찾을 수 없습니다. FFmpeg/ffprobe 가 PATH 에 있는지 확인하세요.`));
@@ -37,6 +58,8 @@ function runBinary(bin: string, args: string[], cwd?: string): Promise<{ stdout:
       }
     });
     proc.on('close', code => {
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      if (verbose) console.log(`[ffmpeg] exit ${code}  (${elapsed}s)`);
       if (code === 0) resolve({ stdout, stderr });
       else reject(new Error(`${bin} exited ${code}\n${stderr.slice(-2000)}`));
     });

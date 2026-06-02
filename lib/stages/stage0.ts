@@ -68,8 +68,112 @@ export async function runStage0(projectId: string): Promise<{
     textFocusedStatus = 'failed';
   }
 
+  // ---- 워터마크/지속 오버레이 제거 ----
+  // 출처/핸들/가게 워터마크처럼 "영상 콘텐츠가 아닌" 지속 오버레이를 spec 에서 미리 제거.
+  // (caption planning 단계의 LLM 판단에만 맡기지 않고, 원천 차단)
+  const wm = stripWatermarkLayers(spec);
+  if (wm.removed > 0) {
+    await appendRawResponse(projectId, {
+      stage: 0, kind: 'watermark_stripped',
+      removed_layers: wm.removed, samples: wm.samples,
+    });
+  }
+
   await writeJson(ARTIFACTS.editSpec(projectId), spec);
   return { ok: true, shots: spec.shots.length, duration: spec.duration, text_focused_pass: textFocusedStatus };
+}
+
+// ============================================================
+// 워터마크 / 지속 오버레이 레이어 제거
+// ----------------------------------------------------------------
+// 영상 "콘텐츠" 가 아니라 운영용으로 화면에 고정으로 박혀 있는 텍스트
+// (출처 핸들, 계정명, 워터마크, 구독/팔로우 안내 등) 를 spec.shots[].caption_layers
+// 에서 통째로 제거한다.
+//
+// 판정 신호:
+//   1) 명백한 키워드 패턴 (@handle, URL, 출처/credit, follow/subscribe/구독/팔로우, #해시태그 단독)
+//   2) 코너(top|bottom + left|right) + (작은 크기 | label/decoration 역할) → 전형적 워터마크 위치
+//   3) (거의) 모든 컷에 동일 텍스트가 반복 + 위 형태 신호 → 지속 오버레이
+//
+// 주의: 중앙·큰 글씨·박스 배경이 있는 "hook" 류는 가게명이 들어가도 콘텐츠로 보고 유지.
+//       (반복된다는 이유만으로 제거하지 않음 — hook 도 전 컷 반복될 수 있으므로)
+// ============================================================
+const WATERMARK_TEXT_RE = /(@[\w.]{2,}|^#[\w가-힣]+$|\b[\w-]+\.(com|co\.kr|net|io|kr|tv)\b|출처|credit|구독|팔로우|\bfollow\b|\bsubscribe\b|\bDM\b)/i;
+
+function stripWatermarkLayers(spec: any): { removed: number; samples: string[] } {
+  const shots: any[] = Array.isArray(spec?.shots) ? spec.shots : [];
+  if (shots.length === 0) return { removed: 0, samples: [] };
+
+  // 1) 텍스트별 등장 컷 수 집계 (같은 컷 내 중복은 1회)
+  const counts = new Map<string, { count: number; layer: any }>();
+  for (const s of shots) {
+    const layers: any[] = Array.isArray(s.caption_layers) ? s.caption_layers : [];
+    const seenInShot = new Set<string>();
+    for (const l of layers) {
+      const key = wmKey(l?.text);
+      if (!key || seenInShot.has(key)) continue;
+      seenInShot.add(key);
+      const prev = counts.get(key);
+      if (prev) prev.count++;
+      else counts.set(key, { count: 1, layer: l });
+    }
+  }
+
+  // 2) 워터마크 판정
+  const wmKeys = new Set<string>();
+  const samples: string[] = [];
+  for (const [key, { count, layer }] of counts) {
+    if (isWatermarkLayer(layer, count, shots.length)) {
+      wmKeys.add(key);
+      const t = String(layer?.text || '').trim();
+      if (t && samples.length < 8) samples.push(t.slice(0, 40));
+    }
+  }
+  if (wmKeys.size === 0) return { removed: 0, samples: [] };
+
+  // 3) 모든 컷에서 제거
+  let removed = 0;
+  for (const s of shots) {
+    const layers: any[] = Array.isArray(s.caption_layers) ? s.caption_layers : [];
+    s.caption_layers = layers.filter((l: any) => {
+      const key = wmKey(l?.text);
+      if (key && wmKeys.has(key)) { removed++; return false; }
+      return true;
+    });
+  }
+  return { removed, samples };
+}
+
+function wmKey(text: any): string {
+  return String(text || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function isWatermarkLayer(l: any, count: number, totalShots: number): boolean {
+  const text = String(l?.text || '').trim();
+  if (!text) return false;
+
+  // (1) 명백한 키워드 → 무조건 워터마크
+  if (WATERMARK_TEXT_RE.test(text)) return true;
+
+  const pos = String(l.position || '').toLowerCase();
+  const align = String(l.horizontal_align || '').toLowerCase();
+  const size = String(l.size_level || '').toLowerCase();
+  const role = String(l.role || '').toLowerCase();
+
+  const isCorner = (pos === 'top' || pos === 'bottom') && (align === 'left' || align === 'right');
+  const isSmall = size === 'small';
+  const isLabel = role === 'label' || role === 'decoration';
+  const noBox = l.has_background_box !== true;
+  const persistent = totalShots >= 3 && count >= Math.ceil(totalShots * 0.6);
+
+  // (2) 코너 + (작음 | 라벨) → 전형적 워터마크 형태
+  if (isCorner && (isSmall || isLabel)) return true;
+
+  // (3) 거의 모든 컷에 반복 + 형태 신호(작음/라벨/코너, 박스 없음) → 지속 오버레이
+  //     중앙·박스 있는 hook 은 콘텐츠로 보고 보존.
+  if (persistent && noBox && (isSmall || isLabel || isCorner)) return true;
+
+  return false;
 }
 
 async function analyzeWithProFallback(
