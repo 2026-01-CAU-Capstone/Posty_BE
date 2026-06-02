@@ -31,12 +31,28 @@ const MAX_CAPTION_CHARS = 60;
 const H_MARGIN = 96;
 const CAPTION_MAX_W = SCRIPT_W - H_MARGIN * 2;   // 888
 const V_MARGIN = 130;
-const STACK_GAP = 34;
+const STACK_GAP_RATIO = 0.42;   // 인접 layer 간 수직 간격 = fontSize × 비율 (동적)
+const STACK_GAP_MIN = 28;
 
-const SIZE_PT: Record<string, number> = { small: 54, medium: 78, large: 104, huge: 132 };
-const MIN_SIZE_PT: Record<string, number> = { small: 38, medium: 46, large: 60, huge: 72 };
-// ASS 의 Outline 은 외곽선 "바깥 두께(px)". SVG stroke-width(perimeter) 대비 절반 가량이 시각적으로 맞음.
-const ASS_OUTLINE_PX: Record<string, number> = { none: 0, thin: 3, medium: 5, thick: 8 };
+// 실제 SNS 자막 임팩트에 맞춰 사이즈 풀을 키운다.
+// 이전 풀: huge=132, large=104, medium=78, small=54
+//   → ref 의 "임팩트 자막" 이 SVG 시안보다 작아 보이는 주된 원인.
+// SCRIPT_H=1920 기준:
+//   huge   ≈ 화면 높이의 ~10%      (200pt)
+//   large  ≈ 7~8% (140pt)
+//   medium ≈ 5%   (96pt)
+//   small  ≈ 3~4% (64pt)
+const SIZE_PT: Record<string, number> = { small: 64, medium: 96, large: 140, huge: 200 };
+// fit 안 되면 줄여나가는 최소치. 시각적 "사이즈 위계" 가 무너지지 않을 정도까지만.
+const MIN_SIZE_PT: Record<string, number> = { small: 50, medium: 62, large: 86, huge: 110 };
+
+// 외곽선/그림자는 fontSize 에 비례시킨다 (px 고정 → 동적 비율).
+// 큰 자막에는 굵은 외곽선이, 작은 자막에는 얇은 외곽선이 자연스러움.
+const OUTLINE_RATIO: Record<string, number> = { none: 0, thin: 0.035, medium: 0.065, thick: 0.105 };
+// 그림자 오프셋도 비례 (기본값 — layer 가 명시 안 했을 때).
+const SHADOW_DEFAULT_RATIO_Y = 0.04;
+const SHADOW_DEFAULT_BLUR_RATIO = 0.05;
+
 const LETTER_SPACING_EM: Record<string, number> = { tight: -0.02, normal: 0, wide: 0.06 };
 
 // ============================================================
@@ -270,15 +286,23 @@ function prepareLayer(layer: CaptionLayer, global: GlobalCaptionStyle): Prepared
   const allCaps = !!global.all_caps;
   const rawText = allCaps ? layer.text.toUpperCase() : layer.text;
   const truncated = truncate(rawText);
-  const sizeLevel = autoSizeLevel(truncated);
-  const requested = SIZE_PT[sizeLevel] ?? 78;
+
+  // ─────────────────────────────────────────────────────
+  // 사이즈 결정 — LLM 의 size_level(=ref 의 의도) 을 우선 존중.
+  //   1) layer.size_level (caption planning 이 ref 의 size 를 그대로 복사) 우선
+  //   2) 없거나 알 수 없는 값이면 글자수 기준 추천(autoSizeLevel)
+  //   3) fitCaptionForFrame 이 너비를 못 맞추면 같은 size_level 안에서만 폰트만 축소
+  //      (size_level 자체는 보존 — ref 의 "large" 가 우리 결과에서 "small" 로 떨어지지 않게)
+  // ─────────────────────────────────────────────────────
+  const llmLevel = String(layer.size_level || '').toLowerCase();
+  const sizeLevel = (llmLevel in SIZE_PT) ? llmLevel : autoSizeLevel(truncated);
+  const requested = SIZE_PT[sizeLevel] ?? SIZE_PT.medium;
   const fit = fitCaptionForFrame(truncated, requested, sizeLevel);
 
   const fontFamily = pickBundledFont({
     category: layer.font_category,
     personality: layer.font_personality,
     emphasis: layer.emphasis,
-    layerIndex: 0,
   });
   const bold = layer.emphasis === 'bold' || layer.emphasis === 'black';
   const italic = layer.italic === true;
@@ -287,7 +311,9 @@ function prepareLayer(layer: CaptionLayer, global: GlobalCaptionStyle): Prepared
   const lineHeight = Math.ceil(fit.fontSize * 1.32);
   let blockH = lineHeight * fit.lines.length;
   if (layer.has_background_box) {
-    blockH += 2 * Math.max(0, Math.floor(layer.background_padding ?? 28));
+    // 박스 padding 도 fontSize 에 비례하게 (이전에는 고정 28px)
+    const padding = Math.max(8, Math.min(48, Math.round(fit.fontSize * (layer.background_padding ? 1 : 0.22))));
+    blockH += 2 * (layer.background_padding ?? padding);
   }
 
   return {
@@ -320,27 +346,37 @@ function placeLayers(items: Prepared[]): void {
   const center = items.filter(p => p.position === 'center');
   const bottom = items.filter(p => p.position === 'bottom');
 
+  // 인접 layer 의 평균 fontSize 에 비례한 동적 gap (큰 자막은 더 넓은 간격).
+  const gapBetween = (a: Prepared, b: Prepared) =>
+    Math.max(STACK_GAP_MIN, Math.round(((a.fontSize + b.fontSize) / 2) * STACK_GAP_RATIO));
+
   // top: 위에서 아래로 (anchor 가 top edge)
   let topCursor = V_MARGIN;
-  for (const p of top) {
+  for (let i = 0; i < top.length; i++) {
+    const p = top[i];
     p.y = topCursor;
-    topCursor += p.blockH + STACK_GAP;
+    const next = top[i + 1];
+    topCursor += p.blockH + (next ? gapBetween(p, next) : 0);
   }
 
   // bottom: 아래에서 위로 (anchor 가 bottom edge). 배열 첫 항목이 가장 아래.
   let bottomCursor = SCRIPT_H - V_MARGIN;
-  for (const p of bottom) {
+  for (let i = 0; i < bottom.length; i++) {
+    const p = bottom[i];
     p.y = bottomCursor;
-    bottomCursor -= p.blockH + STACK_GAP;
+    const next = bottom[i + 1];
+    bottomCursor -= p.blockH + (next ? gapBetween(p, next) : 0);
   }
 
   // center: 화면 중앙 기준으로 블록 중심 정렬 (anchor 가 vertical center)
   if (center.length > 0) {
-    const totalH = center.reduce((s, p) => s + p.blockH, 0) + STACK_GAP * Math.max(0, center.length - 1);
+    let totalH = center.reduce((s, p) => s + p.blockH, 0);
+    for (let i = 0; i < center.length - 1; i++) totalH += gapBetween(center[i], center[i + 1]);
     let edge = SCRIPT_H / 2 - totalH / 2;
-    for (const p of center) {
+    for (let i = 0; i < center.length; i++) {
+      const p = center[i];
       p.y = Math.round(edge + p.blockH / 2);
-      edge += p.blockH + STACK_GAP;
+      edge += p.blockH + (i < center.length - 1 ? gapBetween(p, center[i + 1]) : 0);
     }
   }
 
@@ -398,20 +434,30 @@ function buildStyleLine(name: string, p: Prepared): string {
   if (layer.has_background_box) {
     borderStyle = 3;
     outlineColour = hexToAss(layer.background_color_hex || '#000000');
-    outline = clampNum(Math.round(layer.background_padding ?? 28), 4, 40);
+    // 박스 padding 도 fontSize 비례 (LLM 이 명시 안 하면 자동).
+    const pad = Number.isFinite(layer.background_padding)
+      ? Math.round(layer.background_padding as number)
+      : Math.round(p.fontSize * 0.22);
+    outline = clampNum(pad, 4, 60);
   } else if (layer.has_glow) {
     borderStyle = 1;
     outlineColour = hexToAss(layer.glow_color_hex || layer.color_hex || '#FFFFFF');
-    outline = clampNum(Math.round((layer.glow_radius ?? 8) * 0.6), 3, 12);
+    // 글로우 외곽은 fontSize 의 5~12% 가 자연스러움.
+    const glow = layer.glow_radius ?? Math.round(p.fontSize * 0.08);
+    outline = clampNum(Math.round(glow * 0.6), 3, 24);
   } else {
     borderStyle = 1;
-    outline = ASS_OUTLINE_PX[layer.outline_thickness || 'none'] ?? 0;
+    // 외곽선 두께 = fontSize × 비율 (이전 px 고정 → 비례).
+    const ratio = OUTLINE_RATIO[String(layer.outline_thickness || 'none').toLowerCase()] ?? 0;
+    outline = Math.max(0, Math.round(p.fontSize * ratio));
   }
 
   if (layer.has_shadow) {
+    // shadow 오프셋도 LLM 미기재면 fontSize 비례 기본값.
     const dx = Math.abs(layer.shadow_offset_x ?? 0);
-    const dy = Math.abs(layer.shadow_offset_y ?? 4);
-    shadow = clampNum(Math.round(Math.max(dx, dy, 2)), 0, 30);
+    const dy = Math.abs(layer.shadow_offset_y ?? Math.round(p.fontSize * SHADOW_DEFAULT_RATIO_Y));
+    const minShadow = Math.max(2, Math.round(p.fontSize * SHADOW_DEFAULT_BLUR_RATIO));
+    shadow = clampNum(Math.round(Math.max(dx, dy, minShadow)), 0, 40);
   }
 
   const bold = p.bold ? -1 : 0;
@@ -471,9 +517,10 @@ function buildDialogueLine(styleName: string, p: Prepared, start: number, end: n
     if (dy !== 0) tags.push(`\\yshad${dy}`);
   }
 
-  // 글로우 근사 — 외곽선을 부드럽게 blur
+  // 글로우 근사 — 외곽선을 부드럽게 blur (fontSize 비례)
   if (layer.has_glow && !layer.has_background_box) {
-    const blur = clampNum(Math.round(layer.glow_radius ?? 8), 2, 20);
+    const fallback = Math.round(p.fontSize * 0.08);
+    const blur = clampNum(Math.round(layer.glow_radius ?? fallback), 2, 28);
     tags.push(`\\blur${blur}`);
   }
 
@@ -585,9 +632,12 @@ function truncate(s: string): string {
 }
 
 function fitCaptionForFrame(text: string, requestedSize: number, sizeLevel: string): { lines: string[]; fontSize: number } {
-  const maxLines = sizeLevel === 'small' || sizeLevel === 'medium' ? 3 : 2;
-  const minSize = MIN_SIZE_PT[sizeLevel] ?? 46;
-  for (let size = requestedSize; size >= minSize; size -= 4) {
+  // ref 자막은 거의 1~2줄. 3줄 강제는 어색해서 통일.
+  // small 만 짧은 문구가 박스 안에 4단까지 들어가는 케이스가 있어 예외 허용 (대신 그래도 cap 2).
+  const maxLines = 2;
+  const minSize = MIN_SIZE_PT[sizeLevel] ?? 60;
+  // 폰트 크기를 5pt 씩 줄여서 fit 시도. 너무 거친 step 이면 한 줄로 안 떨어지는 케이스가 있어 5 로 ↓.
+  for (let size = requestedSize; size >= minSize; size -= 5) {
     const wrapped = wrapCaptionText(text, size, maxLines);
     if (wrapped.ok) return { lines: wrapped.lines, fontSize: size };
   }
