@@ -180,18 +180,30 @@ async function uploadFile(filePath: string, mimeType: string): Promise<{ uri: st
 // ============================================================
 export async function callGeminiTextOnly(
   prompt: string,
-  opts?: { model?: string; temperature?: number; maxOutputTokens?: number },
+  opts?: {
+    model?: string;
+    temperature?: number;
+    maxOutputTokens?: number;
+    // Gemini 2.5/3 계열은 thinking 모델 — maxOutputTokens 안에 추론 토큰도 포함된다.
+    // 단순 추출/요약처럼 추론이 거의 필요 없으면 0 으로 끄는 게 안전 (출력 토큰 보존).
+    // undefined 면 모델 기본값(=자동).
+    thinkingBudget?: number;
+  },
 ): Promise<any> {
   if (!config.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY 가 설정되지 않았습니다');
   const model = opts?.model || config.GEMINI_FLASH_MODEL;
   const url = `${config.GEMINI_API_BASE}/v1beta/models/${model}:generateContent`;
+  const generationConfig: any = {
+    responseMimeType: 'application/json',
+    temperature: opts?.temperature ?? 0.6,
+    maxOutputTokens: opts?.maxOutputTokens ?? 16384,
+  };
+  if (typeof opts?.thinkingBudget === 'number') {
+    generationConfig.thinkingConfig = { thinkingBudget: opts.thinkingBudget };
+  }
   const body = {
     contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: {
-      responseMimeType: 'application/json',
-      temperature: opts?.temperature ?? 0.6,
-      maxOutputTokens: opts?.maxOutputTokens ?? 16384,
-    },
+    generationConfig,
   };
   const rawText = await fetchGeminiJsonWithRetry(url, body, `Gemini text ${model}`);
   let raw: any;

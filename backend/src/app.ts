@@ -19,6 +19,7 @@ import {
 } from '../../lib/paths';
 import { checkStageConfig, StageId } from '../../lib/config';
 import { DEFAULT_BRIEF, readStyleBrief, writeStyleBrief } from '../../lib/style-brief';
+import { generateStyleSuggest, readStyleSuggest } from '../../lib/style-suggest';
 import { DEFAULT_TTS_CONFIG, readTtsConfig, writeTtsConfig } from '../../lib/tts-config';
 import { readTtsOutline, validateOutline } from '../../lib/tts-outline';
 import { ensureIgFetchAlive, importInstagramUrl } from '../../lib/ig-fetch';
@@ -282,6 +283,35 @@ app.post('/api/style-brief', async (c) => {
   if (!projectId) return c.json({ error: 'projectId 누락' }, 400);
   await writeStyleBrief(projectId, { ...DEFAULT_BRIEF, ...(brief || {}) });
   return c.json({ ok: true });
+});
+
+// ---- 스타일 자동 추천 (Stage 0.5) ----
+// GET  : 캐시 조회 (없으면 suggest=null)
+// POST : 생성 — body { projectId, force? }. force=true 면 캐시 무시하고 새로 호출.
+app.get('/api/style-suggest', async (c) => {
+  const projectId = c.req.query('projectId') || '';
+  if (!projectId) return c.json({ error: 'projectId 누락' }, 400);
+  const suggest = await readStyleSuggest(projectId);
+  return c.json({ ok: true, suggest, cached: !!suggest });
+});
+
+app.post('/api/style-suggest', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const projectId = String(body.projectId || '').trim();
+  if (!projectId) return c.json({ error: 'projectId 누락' }, 400);
+  try { await fsp.access(projectDir(projectId)); } catch { return c.json({ error: 'project 가 존재하지 않습니다' }, 404); }
+
+  const force = body.force === true;
+  if (!force) {
+    const cached = await readStyleSuggest(projectId);
+    if (cached) return c.json({ ok: true, suggest: cached, cached: true });
+  }
+  try {
+    const suggest = await generateStyleSuggest(projectId);
+    return c.json({ ok: true, suggest, cached: false });
+  } catch (e: any) {
+    return c.json({ error: e?.message || String(e) }, 500);
+  }
 });
 
 app.post('/api/tts-config', async (c) => {

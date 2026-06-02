@@ -2,7 +2,67 @@
 // 모든 LLM 프롬프트 한 곳에서 관리.
 // - REFERENCE_ANALYSIS_PROMPT : Stage 0, Gemini Pro
 // - SOURCE_SHOT_DESCRIPTION_PROMPT : Stage 1, Gemini Flash
+// - buildStyleSuggestPrompt        : Stage 0.5, OpenAI gpt-4o-mini (chat JSON)
+//   (분석 결과 → 마스코트 한 줄 요약 + 옵션 자동 채우기)
 // ============================================================
+
+// ============================================================
+// Stage 0.5 — 분석된 edit-spec.json 을 보고
+//   (1) 마스코트가 사용자에게 건넬 한 줄 요약
+//   (2) 편집 옵션 자동 추천 (사용자가 수정 가능)
+// 을 함께 만들어 돌려준다.
+// ============================================================
+export function buildStyleSuggestPrompt(args: {
+  specSummary: string;
+  styleNote: string;
+}): string {
+  const noteBlock = args.styleNote.trim()
+    ? `\n사용자가 미리 적어둔 자유 노트(있다면 옵션 추천에 반영):\n${args.styleNote.trim()}\n`
+    : '';
+  return `너는 숏폼(릴스/틱톡) 편집 어시스턴트인 곰돌이 마스코트 "Posty" 다.
+사용자가 방금 레퍼런스 영상 1개를 분석해서 결과가 나왔다.
+이 결과를 보고 두 가지를 만들어라.
+
+[1] summary — 마스코트가 사용자에게 건넬 자연스러운 한 줄.
+  - 톤: 친근하고 가볍게. 반말이나 존댓말 모두 가능하지만 너무 딱딱하지 않게.
+  - 형식 예: "아 ~~한 분위기의 릴스를 올리셨군요!", "오~ ~~ 영상이네요!", "~~한 느낌, 좋아요!"
+  - 영상의 핵심 내용·분위기·소재를 한 줄로 요약 (피사체 / 색감 / 페이싱 등).
+  - 최대 80자 (한글 기준).
+
+[2] brief — 사용자가 이어서 채워야 할 편집 옵션을 미리 추천.
+  - 사용자는 받은 값을 그대로 쓰거나 자유롭게 수정한다. 너무 좁게 잡지 말고 영상 내용에서 자연스럽게 뽑아낼 것.
+  - tone : 한 줄, 한국어. 예: "발랄한", "잔잔한", "감성적인", "에너지 넘치는"
+  - purpose : 한 줄, 한국어. 예: "카페 홍보", "여행 vlog", "제품 리뷰", "맛집 추천"
+  - topic_keywords : 5~10개 한국어 키워드. 영상의 주제·소재·분위기·장소·색감 등.
+    각 키워드는 짧게 (1~6자 권장). 예: ["맥주", "이자카야", "노을", "감성", "친구"]
+  - must_include_phrases : 0~3개. 자막에 자연스럽게 들어가면 좋을 짧은 한국어 문구.
+    꼭 필요하지 않으면 빈 배열로. 예: ["오늘 퇴근 후", "딱 한 잔"]
+  - caption_language : "ko" / "en" / "mixed" 중 하나.
+    레퍼런스 자막이 한글이면 "ko", 영어면 "en", 둘 다면 "mixed".
+  - caption_density : "every_cut" / "most_cuts" / "occasional" / "minimal" / "none" 중 하나.
+    레퍼런스에 자막이 매 컷마다 있으면 "every_cut", 거의 있으면 "most_cuts",
+    띄엄띄엄이면 "occasional", 한두 번이면 "minimal", 없으면 "none".
+
+레퍼런스 분석 요약:
+\`\`\`
+${args.specSummary}
+\`\`\`
+${noteBlock}
+JSON 만 출력. 다른 텍스트/마크다운/코드펜스 금지.
+
+{
+  "summary": string,
+  "brief": {
+    "tone": string,
+    "purpose": string,
+    "topic_keywords": string[],
+    "must_include_phrases": string[],
+    "caption_language": "ko" | "en" | "mixed",
+    "caption_density": "every_cut" | "most_cuts" | "occasional" | "minimal" | "none"
+  }
+}
+`;
+}
 
 // ============================================================
 // 사용자 스타일 노트 주입 헬퍼
