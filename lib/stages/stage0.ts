@@ -19,6 +19,7 @@ import {
   styleNoteBlock,
 } from '../prompts';
 import { clearStyleSuggest } from '../style-suggest';
+import { preserveLayerDesign } from '../caption-ass';
 import { config } from '../config';
 
 export type RunStage0Options = {
@@ -288,6 +289,8 @@ function normalizeLayer(l: any): any | null {
     font_personality: String(l.font_personality || '').toLowerCase(),
     role: String(l.role || 'none').toLowerCase(),
     tone: String(l.tone || 'none').toLowerCase(),
+    // 외곽선/그림자/박스/그라데이션/글로우/자간/등장애니메이션 보존 (edit-spec 까지 전달).
+    ...preserveLayerDesign(l),
   };
 }
 

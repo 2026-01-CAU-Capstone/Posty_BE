@@ -196,6 +196,56 @@ ${eventLines.join('\n')}
 }
 
 // ============================================================
+// 분석 단계(Stage0/Stage1)에서 캡션 layer 의 "디자인 필드"를 보존하기 위한 헬퍼.
+//
+// 배경: Stage0(normalizeLayer)·Stage1(normalizeLayers)이 예전에 text/위치/폰트 등
+// 기본 11개 필드만 남기고 outline/shadow/box/gradient/glow/letter_spacing/
+// entry_animation 을 통째로 버려서, 렌더러(sanitizeLayer)가 항상 global 스타일로만
+// 폴백 → 레퍼런스 자막 "형식 복사"가 안 됐다.
+//
+// 정책: 값이 "있을 때만" 담는다. 없으면 키를 만들지 않아 undefined 로 남겨,
+// 렌더 단계 sanitizeLayer 가 global 스타일로 폴백할 여지를 그대로 둔다.
+// ============================================================
+export function preserveLayerDesign(raw: any): Partial<CaptionLayer> {
+  const out: Partial<CaptionLayer> = {};
+  if (!raw || typeof raw !== 'object') return out;
+  const str = (v: any) => (typeof v === 'string' && v.trim() ? v : undefined);
+  const num = (v: any) => (Number.isFinite(v) ? Number(v) : undefined);
+
+  const outlineColor = str(raw.outline_color_hex);
+  if (outlineColor) out.outline_color_hex = outlineColor;
+  const outlineThickness = str(raw.outline_thickness);
+  if (outlineThickness) out.outline_thickness = outlineThickness.toLowerCase();
+
+  if (raw.has_shadow === true || raw.has_shadow === false) out.has_shadow = raw.has_shadow === true;
+  const shadowColor = str(raw.shadow_color_hex);
+  if (shadowColor) out.shadow_color_hex = shadowColor;
+  if (num(raw.shadow_offset_x) !== undefined) out.shadow_offset_x = Number(raw.shadow_offset_x);
+  if (num(raw.shadow_offset_y) !== undefined) out.shadow_offset_y = Number(raw.shadow_offset_y);
+  if (num(raw.shadow_blur) !== undefined) out.shadow_blur = Number(raw.shadow_blur);
+
+  if (raw.has_background_box === true || raw.has_background_box === false) out.has_background_box = raw.has_background_box === true;
+  const boxColor = str(raw.background_color_hex);
+  if (boxColor) out.background_color_hex = boxColor;
+  if (num(raw.background_radius) !== undefined) out.background_radius = Number(raw.background_radius);
+  if (num(raw.background_padding) !== undefined) out.background_padding = Number(raw.background_padding);
+
+  if (raw.gradient && typeof raw.gradient === 'object') out.gradient = raw.gradient;
+
+  if (raw.has_glow === true || raw.has_glow === false) out.has_glow = raw.has_glow === true;
+  const glowColor = str(raw.glow_color_hex);
+  if (glowColor) out.glow_color_hex = glowColor;
+  if (num(raw.glow_radius) !== undefined) out.glow_radius = Number(raw.glow_radius);
+
+  const ls = str(raw.letter_spacing);
+  if (ls) out.letter_spacing = ls.toLowerCase();
+  const ea = str(raw.entry_animation);
+  if (ea) out.entry_animation = ea.toLowerCase();
+
+  return out;
+}
+
+// ============================================================
 // Layer sanitize — 색은 강제하지 않고 "구조"(외곽선/그림자 존재)만 보장.
 // (SVG 버전과 동일 정책)
 // ============================================================
