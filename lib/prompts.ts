@@ -137,6 +137,7 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
         {
           "text": string,                        // 한 줄 (글자 그대로)
           "position": "top" | "center" | "bottom",
+          "vertical_ratio": number,              // 자막 세로 중심 위치 0.0(맨 위)~1.0(맨 아래). position 보다 정밀 — 화면에서 실제 보이는 높이를 정확히 추정 (예: 살짝 위 0.18, 한가운데 0.5, 하단 0.86). 정형화 방지에 중요.
           "horizontal_align": "left" | "center" | "right",
           "size_level": "small" | "medium" | "large" | "huge",
           "color_hex": string,                   // "#RRGGBB" — 본문(또는 첫 부분) 글자 색
@@ -241,6 +242,8 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
 - caption_layers 는 컷마다 화면에 보이는 텍스트의 개수만큼 만들어라. 글자가 없으면 빈 배열 [].
 - **레퍼런스에 사이즈/폰트가 다른 2개 텍스트가 동시에 보이면 layers 에 두 개를 모두 분리해서 넣어라.**
   예: 위에 큰 강조 hook + 아래 작은 부연 설명 → layer 2개
+- **⚠ 1 layer = 화면의 "한 텍스트 덩어리"(같은 크기·위치·줄).** 크기/위치/역할이 다른 텍스트는 절대 한 layer 로 합치지 마라. 합치면 한 layer 의 글자수가 늘어 렌더에서 폰트가 자동 축소돼 **원본보다 작아진다.**
+- **color_runs 는 "한 덩어리 안에서 색만 중간에 바뀌는" 경우 전용** (예: 한 줄 "오늘 [특가] 세일" 중 특가만 빨강). 색이 다르다고 별개의 텍스트를 color_runs 로 묶지 마라 — 그건 위처럼 별도 layer 다. 각 layer 의 크기는 항상 ref 의 그 덩어리 크기를 그대로 유지.
 - size_level (각 layer): 그 글자가 화면 너비에서 차지하는 비율로 추정.
   · 1/4 미만 = "small" / 1/4~1/2 = "medium" / 1/2~3/4 = "large" / 3/4↑ = "huge"
 - color_hex: 흰색 "#FFFFFF", 검정 "#000000", 노란 강조 "#FFE600" 등 정확히 추정.
@@ -419,10 +422,11 @@ shot_index 는 영상의 시각적 컷 순서로 0 부터 매기고, shot_start 
         {
           "text": string,
           "position": "top" | "center" | "bottom",
+          "vertical_ratio": number,              // 자막 세로 중심 위치 0.0(맨 위)~1.0(맨 아래). position 보다 정밀 — 화면에서 실제 보이는 높이를 정확히 추정 (예: 살짝 위 0.18, 한가운데 0.5, 하단 0.86). 정형화 방지에 중요.
           "horizontal_align": "left" | "center" | "right",
           "size_level": "small" | "medium" | "large" | "huge",
           "color_hex": string,
-          "color_runs": [                        // 글자 중간에 색이 바뀌면 부분별로 끊어서. 색 일정하면 []. runs.text 이으면 text 와 동일.
+          "color_runs": [                        // "한 덩어리 안"에서 색만 중간에 바뀔 때 전용. 색 일정하면 []. runs.text 이으면 text 와 동일. ⚠ 크기/위치 다른 별개 텍스트를 색 다르다고 합치지 마라(각각 별도 layer). 합치면 길어져 폰트가 작아짐.
             { "text": string, "color_hex": string }
           ],
           "emphasis": "regular" | "bold" | "black",
@@ -658,6 +662,7 @@ ${cutLines}
      · has_glow, glow_color_hex, glow_radius
      · letter_spacing, entry_animation
      · color_runs (글자 중간에 색이 바뀌는 패턴 — ref 에 있으면 같은 구조로, text 만 우리 카피에 맞춰 바꿔라)
+     · vertical_ratio (자막 세로 위치 0~1 — ref 가 둔 높이를 그대로. top/center/bottom 으로 뭉개지 말고 실제 비율 유지)
    - **임의로 디자인 값 만들어내지 마라.** ref 와 시각적으로 다르면 매칭의 의미가 사라진다.
    - matched_ref_layers 가 비어있는 컷에서 자막을 새로 만들 때는 caption_global_style 의 has_outline / outline_color_hex / has_shadow / has_background_box / primary_color_hex 등을 따라가라.
    - 사용자 styleNote 가 명시적으로 "박스 배경 빼라" 같은 지시를 했을 때만 변형.
@@ -675,10 +680,11 @@ JSON 만 출력. 다른 텍스트 금지.
         {
           "text": string,
           "position": "top" | "center" | "bottom",
+          "vertical_ratio": number,              // 자막 세로 중심 위치 0.0(맨 위)~1.0(맨 아래). position 보다 정밀 — 화면에서 실제 보이는 높이를 정확히 추정 (예: 살짝 위 0.18, 한가운데 0.5, 하단 0.86). 정형화 방지에 중요.
           "horizontal_align": "left" | "center" | "right",
           "size_level": "small" | "medium" | "large" | "huge",
           "color_hex": string,
-          "color_runs": [                        // 글자 중간에 색이 바뀌면 부분별로 끊어서. 색 일정하면 []. runs.text 이으면 text 와 동일.
+          "color_runs": [                        // "한 덩어리 안"에서 색만 중간에 바뀔 때 전용. 색 일정하면 []. runs.text 이으면 text 와 동일. ⚠ 크기/위치 다른 별개 텍스트를 색 다르다고 합치지 마라(각각 별도 layer). 합치면 길어져 폰트가 작아짐.
             { "text": string, "color_hex": string }
           ],
           "emphasis": "regular" | "bold" | "black",
