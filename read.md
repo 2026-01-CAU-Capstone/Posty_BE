@@ -257,7 +257,7 @@ Gemini 2.5/3 Flash 는 thinking 모델이라 `maxOutputTokens` 안에 추론 토
 
 **로직:**
 0. **인라인 색 (`color_runs`)** — 한 자막 안에서 색이 중간에 바뀌면(예: "오늘 [특가] 세일") `color_runs[{text,color_hex}]` 로 분석·보존, 렌더 시 grapheme 단위로 ASS `\1c` 인라인 색 적용 (wrap 줄바꿈에도 비공백 문자 순서로 정확히 매핑).
-0-bis. **주체 기준 위치** — 단일 자막 컷은 `subject_center_y` 로 주피사체를 피해 배치 (주체가 위면 자막 아래, 아래면 위). 멀티 layer 컷은 ref 디자인 유지.
+0-bis. **자막 세로 위치** — 분석에서 `vertical_ratio(0~1)` 를 뽑아 그 비율 그대로 배치(`placeLayers` 가 고정 마진 스냅 대신 `y=ratio×1920`). top/center/bottom 3단계로 뭉개지던 정형화 해소. `vertical_ratio` 가 없을 때만 `subject_center_y` 기반(주체 반대편) 또는 거친 position 폴백.
 1. cut별 layers 결정 — `planned_caption_layers` 우선, 없으면 `ref_caption_layers` 폴백
 2. layers 총합 0이면 video stream을 그대로 copy
 3. 그 외: `buildCaptionAss(cuts, globalStyle)` ([lib/caption-ass.ts](lib/caption-ass.ts)) — 단일 .ass 문서 생성
