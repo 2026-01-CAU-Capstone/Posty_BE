@@ -9,21 +9,34 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { ARTIFACTS, appendRawResponse, readStyleNote, referenceDir, writeJson } from '../paths';
+import { ARTIFACTS, appendRawResponse, readJson, readStyleNote, referenceDir, writeJson } from '../paths';
 import { analyzeVideoStructured } from '../gemini';
 import { probeDuration } from '../ffmpeg';
 import {
   REFERENCE_ANALYSIS_PROMPT,
   REFERENCE_TEXT_FOCUSED_PROMPT,
+  buildReanalysisPrompt,
   styleNoteBlock,
 } from '../prompts';
+import { clearStyleSuggest } from '../style-suggest';
 import { config } from '../config';
 
-export async function runStage0(projectId: string): Promise<{
+export type RunStage0Options = {
+  // true 면 기존 edit-spec.json 을 읽어 프롬프트에 함께 넣고 "보강 분석" 으로 돌린다.
+  reanalyze?: boolean;
+  // 재분석 시 사용자가 특히 봐주길 원하는 포인트(자유 문장).
+  userFocus?: string;
+};
+
+export async function runStage0(
+  projectId: string,
+  options: RunStage0Options = {},
+): Promise<{
   ok: true;
   shots: number;
   duration: number;
   text_focused_pass: 'ok' | 'failed' | 'skipped';
+  reanalyzed: boolean;
 }> {
   const refDir = referenceDir(projectId);
   const files = (await fs.readdir(refDir).catch(() => []))
@@ -34,13 +47,39 @@ export async function runStage0(projectId: string): Promise<{
   const measuredDuration = await probeDuration(refFile);
 
   const styleNote = await readStyleNote(projectId);
-  const prompt = styleNoteBlock(styleNote) + REFERENCE_ANALYSIS_PROMPT;
 
-  // ---- 1차: 메인 분석 ----
+  // 재분석 모드 — 기존 spec 이 있으면 그걸 프롬프트에 끼워 넣어 second-pass 로 돌린다.
+  // 기존 결과는 ".previous.json" 으로 백업해두어 디버깅/비교용으로 남긴다.
+  let prompt: string;
+  let reanalyzed = false;
+  if (options.reanalyze) {
+    const previousSpec = await readJson<any>(ARTIFACTS.editSpec(projectId));
+    if (previousSpec) {
+      const backupPath = ARTIFACTS.editSpec(projectId).replace(/\.json$/i, '.previous.json');
+      await writeJson(backupPath, previousSpec);
+      await appendRawResponse(projectId, {
+        stage: 0, kind: 'reanalyze_start',
+        backup: path.basename(backupPath),
+        user_focus: options.userFocus || null,
+      });
+      prompt = styleNoteBlock(styleNote) + buildReanalysisPrompt(previousSpec, options.userFocus);
+      reanalyzed = true;
+    } else {
+      // 이전 분석 결과가 없으면 그냥 일반 분석으로 폴백
+      prompt = styleNoteBlock(styleNote) + REFERENCE_ANALYSIS_PROMPT;
+    }
+  } else {
+    prompt = styleNoteBlock(styleNote) + REFERENCE_ANALYSIS_PROMPT;
+  }
+
+  // ---- 1차: 메인 분석 (재분석 모드면 second-pass 프롬프트) ----
   const main = await analyzeWithProFallback(refFile, prompt, 'main');
   const { raw, parsed } = main;
   await appendRawResponse(projectId, {
-    stage: 0, kind: `${main.kind}_video_main`, filename: files[0], response: raw,
+    stage: 0,
+    kind: reanalyzed ? `${main.kind}_video_main_reanalyze` : `${main.kind}_video_main`,
+    filename: files[0],
+    response: raw,
   });
 
   const spec = parsed || {};
@@ -80,7 +119,12 @@ export async function runStage0(projectId: string): Promise<{
   }
 
   await writeJson(ARTIFACTS.editSpec(projectId), spec);
-  return { ok: true, shots: spec.shots.length, duration: spec.duration, text_focused_pass: textFocusedStatus };
+
+  // spec 이 바뀌었으니 캐시된 style-suggest 는 무효화 (다음 호출 시 새로 생성).
+  // 첫 분석에선 사실상 noop 이지만, 재분석 시엔 stale 한 추천이 남는 걸 막아준다.
+  await clearStyleSuggest(projectId);
+
+  return { ok: true, shots: spec.shots.length, duration: spec.duration, text_focused_pass: textFocusedStatus, reanalyzed };
 }
 
 // ============================================================

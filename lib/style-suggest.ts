@@ -28,8 +28,15 @@ export type SuggestBrief = {
   caption_density: '' | 'every_cut' | 'most_cuts' | 'occasional' | 'minimal' | 'none';
 };
 
+// 레퍼런스 분석을 한 줄이 아니라 항목별로 풀어 설명 (사용자가 무엇이 분석됐는지 파악).
+export type AnalysisPoint = {
+  label: string;    // 예: "무드", "편집 리듬", "색감", "자막 스타일", "오디오", "소재"
+  detail: string;   // 1~2 문장 설명
+};
+
 export type StyleSuggest = {
-  summary: string;
+  summary: string;            // 마스코트가 건네는 짧은 인사형 한 줄 (말풍선용)
+  analysis: AnalysisPoint[];  // 항목별 상세 분석
   brief: SuggestBrief;
   generated_at: string;
   model: string;
@@ -42,7 +49,9 @@ function suggestFile(projectId: string): string {
 }
 
 export async function readStyleSuggest(projectId: string): Promise<StyleSuggest | null> {
-  return readJson<StyleSuggest>(suggestFile(projectId));
+  const s = await readJson<StyleSuggest>(suggestFile(projectId));
+  // 구버전 캐시(analysis 필드 없음)도 타입 불변식을 지키도록 정규화.
+  return s ? { ...s, analysis: normalizeAnalysis((s as any).analysis) } : null;
 }
 
 export async function clearStyleSuggest(projectId: string): Promise<void> {
@@ -65,7 +74,7 @@ export async function generateStyleSuggest(projectId: string): Promise<StyleSugg
     parsed = await chatJson(prompt, {
       model,
       temperature: 0.6,
-      maxTokens: 1024,
+      maxTokens: 1800,   // summary + 항목별 analysis + brief 가 함께 들어가므로 넉넉히
     });
   } catch (e: any) {
     await appendRawResponse(projectId, {
@@ -75,6 +84,8 @@ export async function generateStyleSuggest(projectId: string): Promise<StyleSugg
     throw e;
   }
 
+  const analysis = normalizeAnalysis(parsed?.analysis);
+
   await appendRawResponse(projectId, {
     stage: 0.5,
     kind: 'style_suggest',
@@ -82,15 +93,29 @@ export async function generateStyleSuggest(projectId: string): Promise<StyleSugg
     model,
     parsed_ok: !!parsed,
     summary_chars: String(parsed?.summary || '').length,
+    analysis_points: analysis.length,
     keywords_count: Array.isArray(parsed?.brief?.topic_keywords) ? parsed.brief.topic_keywords.length : 0,
   });
 
+  const summaryRaw = clampStr(parsed?.summary, 200);
+  const brief = normalizeBrief(parsed?.brief);
   const result: StyleSuggest = {
-    summary: clampStr(parsed?.summary, 200) || '레퍼런스 분석을 마쳤어요! 어떤 느낌으로 편집할지 골라봐요.',
-    brief: normalizeBrief(parsed?.brief),
+    summary: summaryRaw || '레퍼런스 분석을 마쳤어요! 어떤 느낌으로 편집할지 골라봐요.',
+    analysis,
+    brief,
     generated_at: new Date().toISOString(),
     model,
   };
+
+  // 사실상 빈 결과(요약·분석·brief 모두 비었음)면 캐시를 오염시키지 않는다.
+  // 친근한 fallback 요약은 이번엔 돌려주되, 저장은 건너뛰어 다음 호출에서 재생성.
+  const degraded = !summaryRaw && analysis.length === 0
+    && !brief.tone && !brief.purpose
+    && brief.topic_keywords.length === 0 && brief.must_include_phrases.length === 0;
+  if (degraded) {
+    await appendRawResponse(projectId, { stage: 0.5, kind: 'style_suggest_empty', model });
+    return result;
+  }
 
   await ensureDir(projectDir(projectId));
   await writeJson(suggestFile(projectId), result);
@@ -151,6 +176,19 @@ function normalizeBrief(raw: any): SuggestBrief {
     caption_language: normEnum(raw?.caption_language, ['ko', 'en', 'mixed']),
     caption_density: normEnum(raw?.caption_density, ['every_cut', 'most_cuts', 'occasional', 'minimal', 'none']),
   };
+}
+
+// LLM 의 analysis 배열을 정규화 — {label, detail} 항목만, 길이 제한, 최대 8개.
+function normalizeAnalysis(raw: any): AnalysisPoint[] {
+  if (!Array.isArray(raw)) return [];
+  const out: AnalysisPoint[] = [];
+  for (const it of raw) {
+    const label = clampStr(it?.label, 24);
+    const detail = clampStr(it?.detail, 240);
+    if (label && detail) out.push({ label, detail });
+    if (out.length >= 8) break;
+  }
+  return out;
 }
 
 function clampStr(v: any, max: number): string {

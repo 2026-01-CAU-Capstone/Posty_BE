@@ -19,17 +19,28 @@ export function buildStyleSuggestPrompt(args: {
   const noteBlock = args.styleNote.trim()
     ? `\n사용자가 미리 적어둔 자유 노트(있다면 옵션 추천에 반영):\n${args.styleNote.trim()}\n`
     : '';
-  return `너는 숏폼(릴스/틱톡) 편집 어시스턴트인 곰돌이 마스코트 "Posty" 다.
+  return `너는 숏폼(릴스/틱톡) 편집 어시스턴트인 클래퍼보드 마스코트 "Posty" 다.
 사용자가 방금 레퍼런스 영상 1개를 분석해서 결과가 나왔다.
-이 결과를 보고 두 가지를 만들어라.
+이 결과를 보고 세 가지를 만들어라.
 
-[1] summary — 마스코트가 사용자에게 건넬 자연스러운 한 줄.
+[1] summary — 마스코트가 사용자에게 건넬 자연스러운 한 줄 인사.
   - 톤: 친근하고 가볍게. 반말이나 존댓말 모두 가능하지만 너무 딱딱하지 않게.
   - 형식 예: "아 ~~한 분위기의 릴스를 올리셨군요!", "오~ ~~ 영상이네요!", "~~한 느낌, 좋아요!"
-  - 영상의 핵심 내용·분위기·소재를 한 줄로 요약 (피사체 / 색감 / 페이싱 등).
-  - 최대 80자 (한글 기준).
+  - 영상의 핵심 내용·분위기를 한 줄로. 최대 80자 (한글 기준).
 
-[2] brief — 사용자가 이어서 채워야 할 편집 옵션을 미리 추천.
+[2] analysis — 레퍼런스에서 "무엇을 어떻게 분석했는지" 항목별로 풀어 설명.
+  - 사용자가 분석 내용을 구체적으로 파악할 수 있게, 항목(label) + 설명(detail) 쌍의 배열로.
+  - 항목은 4~6개. 아래 관점을 골고루 다뤄라 (해당되는 것 위주로):
+    · "무드/분위기"   — 영상 전반의 감성·톤
+    · "편집 리듬"     — 컷 길이·페이싱·전환 속도 (pacing 기반)
+    · "색감/비주얼"   — 밝기·대비·채도·색온도·무드 (color_style 기반)
+    · "자막 스타일"   — 폰트 인상·크기·위치·빈도·언어 (caption_global_style / caption_pattern 기반)
+    · "오디오/BGM"    — BGM 유무·장르·템포·에너지, 발화 여부 (audio_profile 기반)
+    · "소재/주제"     — 무엇을 담은 영상인지, 주요 피사체 (shots / topic 기반)
+  - 각 detail 은 1~2 문장, 한국어, 분석 근거가 드러나게 구체적으로. 최대 240자.
+  - label 은 짧게(최대 24자). 위 예시 라벨을 그대로 써도 좋다.
+
+[3] brief — 사용자가 이어서 채워야 할 편집 옵션을 미리 추천.
   - 사용자는 받은 값을 그대로 쓰거나 자유롭게 수정한다. 너무 좁게 잡지 말고 영상 내용에서 자연스럽게 뽑아낼 것.
   - tone : 한 줄, 한국어. 예: "발랄한", "잔잔한", "감성적인", "에너지 넘치는"
   - purpose : 한 줄, 한국어. 예: "카페 홍보", "여행 vlog", "제품 리뷰", "맛집 추천"
@@ -52,6 +63,9 @@ JSON 만 출력. 다른 텍스트/마크다운/코드펜스 금지.
 
 {
   "summary": string,
+  "analysis": [
+    { "label": string, "detail": string }
+  ],
   "brief": {
     "tone": string,
     "purpose": string,
@@ -276,6 +290,97 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
   · outline_color_hex 는 글자색과 명도가 충분히 다른가? (흰 글자에 회색 외곽선 같은 답 금지)
 - **신규 디자인 필드들도 caption_global_style 의 has_outline/outline_color 와 일치해야 자연스럽다.** layer 별 outline 이 다른 영상이 아니면 모든 layer 의 outline_color_hex 가 동일.
 - 절대 JSON 외 텍스트 출력 금지.`;
+
+
+// ============================================================
+// Stage 0 재분석 프롬프트 — 사용자가 "다시 분석하기" 를 눌렀을 때.
+// 이전 분석 결과를 함께 넣어, 같은 자리를 똑같이 답하지 말고 **놓친/부정확
+// /불충분한 부분만 골라 보강** 하도록 유도한다.
+// 출력 스키마는 메인 분석과 동일 — 이전 결과 + 새 발견을 합친 완전한 spec.
+// 한 번 더 같은 모델에게 같은 영상을 보여줘서 "second pass" 효과를 노린다.
+// ============================================================
+export function buildReanalysisPrompt(previousSpec: any, userFocus?: string): string {
+  const trimmedPrev = pruneSpecForPrompt(previousSpec);
+  const previousJson = JSON.stringify(trimmedPrev, null, 2);
+
+  const focusBlock = (userFocus || '').trim()
+    ? `사용자가 이번 패스에서 특히 봐주길 원하는 포인트:
+"""
+${userFocus!.trim().slice(0, 800)}
+"""
+위 포인트를 우선 깊이 보고, 그 외에도 이전 분석이 놓친 영역이 있으면 함께 보강해라.
+
+`
+    : '';
+
+  return `너는 같은 레퍼런스 영상을 두 번째로 다시 보는 편집 디렉터다.
+이전 패스의 분석 결과가 아래에 있으니 **반복 작업을 최소화하고**, 이번엔 그때 놓친
+부분을 집중적으로 잡는 second-pass 분석을 해라.
+
+${focusBlock}== 이전 분석 결과 (재현하지 말고 보강 대상으로 사용) ==
+\`\`\`json
+${previousJson}
+\`\`\`
+
+== 재분석 지시 ==
+이전 결과를 그대로 베껴서 출력하지 마라. 영상을 다시 보고 다음을 찾아내라:
+
+1. **빠진 컷** — shots[] 에 누락된 cut boundary 가 있으면 추가 (특히 짧은 컷·점프컷).
+2. **부정확한 텍스트** — caption_layers[].text 가 추측이거나 일부만 적혀 있으면, 다시 보고 정확히 받아 적어라.
+   · 글자가 흐릿하면 빈 문자열 "" 로 정정 (틀린 추측 유지 금지).
+   · 한글이 알파벳/번역으로 잘못 적혀 있으면 한글 그대로 정정.
+3. **빈약한 디자인 디테일** — caption_layers 의 outline / shadow / background_box / gradient / glow / letter_spacing /
+   entry_animation 같은 디자인 필드가 default 값 그대로(예: outline_thickness="none", has_shadow=false, gradient.type="none")
+   적혀 있는데 실제 영상에선 보이면 정직하게 갱신해라.
+4. **일반적인 묘사** — scene_description / subject / composition / camera_motion 가 너무 일반적("a person", "indoor")
+   이면 영상에서 더 구체적인 단서를 찾아 풍부하게.
+5. **놓친 패턴** — caption_pattern 의 recurring_structures / subject_substitution_hints / key_phrases 가 빈약하면
+   영상의 반복 구조를 다시 살펴 채워라.
+6. **color_style / audio_profile** 의 mood / bgm_genre / bgm_instruments 가 generic 하다면 실제 톤·악기 단서를 잡아 정정.
+
+== 출력 규칙 ==
+- 출력 JSON 스키마는 **메인 분석과 정확히 동일**. 같은 모든 필드를 채워라.
+- 이전 분석에서 **정확했던 부분(검증된 shot boundary, 명확한 텍스트 등)은 그대로 유지** 하면서,
+  위에서 찾은 보강 사항을 **함께 반영한 완전한 새 spec** 하나만 출력해라.
+- 절대 \`\`\`json 같은 코드펜스 / 설명 / 주석 / 마크다운 출력 금지. JSON 객체 하나만.
+
+(스키마 / 규칙 — 동일하게 따라라)
+
+${REFERENCE_ANALYSIS_PROMPT}`;
+}
+
+// 프롬프트에 넣기 위해 이전 spec 을 가볍게 가공.
+// raw spec 은 shots 수가 많아지면 토큰 부담이 크므로, 분석에 핵심적인 필드만 남긴다.
+function pruneSpecForPrompt(spec: any): any {
+  if (!spec || typeof spec !== 'object') return {};
+  const pruned: any = {
+    duration: spec.duration,
+    aspect_ratio: spec.aspect_ratio,
+    pacing: spec.pacing,
+    color_style: spec.color_style,
+    audio_profile: spec.audio_profile,
+    caption_global_style: spec.caption_global_style,
+    caption_pattern: spec.caption_pattern,
+  };
+  if (Array.isArray(spec.shots)) {
+    pruned.shots = spec.shots.map((s: any) => ({
+      index: s.index,
+      start: s.start,
+      end: s.end,
+      duration: s.duration,
+      shot_type: s.shot_type,
+      subject: s.subject,
+      scene_description: s.scene_description,
+      composition: s.composition,
+      camera_motion: s.camera_motion,
+      transition_to_next: s.transition_to_next,
+      // caption_layers 는 텍스트와 핵심 디자인 필드만 (디자인 디테일은 전체 보존)
+      caption_layers: Array.isArray(s.caption_layers) ? s.caption_layers : [],
+      required_tags: Array.isArray(s.required_tags) ? s.required_tags : [],
+    }));
+  }
+  return pruned;
+}
 
 
 // ============================================================
@@ -683,12 +788,8 @@ function captionLanguageBlock(mode?: string): string {
 }
 
 // ============================================================
-// 영상 평가 (TTS 1단계) — cut.mp4 를 Gemini Pro 에 첨부해 각 컷의 실제 내용,
-// 자막의 합리성, 나레이션이 다뤄야 할 포인트를 JSON 으로 먼저 받는다.
-// 이후 나레이션 작성 호출(buildNarrationOutlinePrompt) 의 입력으로 사용.
-//
-// 분리 이유: 한 번의 호출에서 "영상 본 다음 자막 검증 + 나레이션 작성" 을
-// 한꺼번에 요구하면 평가가 부실해지고 자막을 그대로 읽는 경향이 강해진다.
+// 나레이션 컷 메타 — 각 컷의 시간/내용/자막 정보. narration.ts 가
+// edit-plan 으로부터 만들어 buildNarrationOutlinePrompt 에 넘긴다.
 // ============================================================
 export type TtsCutMeta = {
   cut_index: number;
@@ -704,141 +805,26 @@ export type TtsCutMeta = {
   source_filename?: string;      // 원본 파일명 (사용자가 의미있게 지었다면 단서)
 };
 
-function formatCutLine(c: TtsCutMeta): string {
-  const dur = (c.output_end - c.output_start).toFixed(2);
-  const bits: string[] = [];
-  bits.push(`cut ${c.cut_index} [${c.output_start.toFixed(2)}~${c.output_end.toFixed(2)}s, ${dur}s]`);
-  if (c.caption_text) bits.push(`caption="${c.caption_text}"`);
-  if (c.subject) bits.push(`subject="${c.subject.slice(0, 80)}"`);
-  if (c.shot_type) bits.push(`shot=${c.shot_type}`);
-  if (c.tags && c.tags.length > 0) bits.push(`tags=[${c.tags.slice(0, 8).join(',')}]`);
-  if (c.source_filename) bits.push(`src=${c.source_filename}`);
-  if (c.spoken) bits.push(`spoken="${c.spoken.slice(0, 100)}"`);
-  if (c.scene) bits.push(`scene="${c.scene.slice(0, 120)}"`);
-  return bits.join(' | ');
-}
-
-export function buildVideoEvaluationPrompt(args: {
-  totalDuration: number;
-  sourceContext?: string;        // 소스 영상 전체 컨텍스트 (선택) — 파일명 목록 / reference topic 등
-  cuts: TtsCutMeta[];
-}): string {
-  const cutLines = args.cuts.map(formatCutLine).join('\n');
-  const ctxBlock = args.sourceContext
-    ? `\n═══════════════════════════════\n[소스 영상 전체 컨텍스트 — 계획 · 파일 목록 · reference topic 등]\n═══════════════════════════════\n${args.sourceContext.trim()}\n`
-    : '';
-
-  return `너는 영상 사실 검토자다. 자동 편집된 짧은 영상(총 ${args.totalDuration.toFixed(2)}초) 이 첨부됐다.
-다른 작업(나레이션 작성 등) 은 절대 하지 말고, 오직 **컷별 평가 JSON** 만 출력해라.
-${ctxBlock}
-
-═══════════════════════════════
-[평가 항목]
-═══════════════════════════════
-각 컷마다 영상을 직접 보고 다음을 평가한다.
-
-1) what_happens (한 문장): 컷에서 실제로 무엇이 일어나는지 본 그대로 묘사. 자동 묘사(auto_scene) 가 부정확하면 영상에서 본 내용을 우선.
-2) caption_consistency: 자막 텍스트가 화면 내용과 부합하는가?
-   - "match"   = 자막이 화면 내용을 정확히 반영
-   - "loose"   = 살짝 추상적이지만 어긋나진 않음 (시적 표현 등)
-   - "mismatch" = 자막이 화면 내용과 모순됨 (예: "여의도의 봄" 인데 영상은 한겨울)
-   - "no_caption" = 이 컷에 자막 없음
-3) caption_plausibility: 자막 문구 자체가 영상 주제로서 합리적인가? (자막 hallucination / 무의미한 텍스트 감지)
-   - "ok"     = 자연스럽고 합리적
-   - "weak"   = 약간 부자연스럽거나 평이함
-   - "broken" = 명백히 hallucinated / 의미 없음 / 어색한 한국어
-   - "no_caption"
-4) narration_guidance (한 줄): 이 컷에서 음성 나레이션이 무엇을 다루면 좋을지 한 줄 가이드. **자막을 그대로 읽지 말 것** 을 전제로, 시각 채널이 못 전하는 정보(분위기·맥락·이유 등) 를 짚어줘라. 컷이 단순 b-roll 이라 침묵이 적절하면 "silence" 라고 적어라.
-5) is_broll (boolean): 이 컷이 정보 없는 분위기/연결 컷이라 나레이션 없이 두는 게 자연스러우면 true.
-6) arc_role: 이 컷이 영상 전체 서사에서 맡는 역할.
-   - "hook"   = 도입/관심 끌기 (보통 영상 초반 1~2 컷)
-   - "build"  = 본론 전개, 정보 누적, 장면 묘사
-   - "reveal" = 핵심 메시지·하이라이트·전환점
-   - "outro"  = 마무리, 여운, CTA
-   - "broll"  = 분위기/연결 컷 (서사 진행과 무관, 시각적 휴식)
-
-마지막으로 영상 전체의 흐름을 묘사한다.
-- video_summary (한 문단): 무엇에 관한 영상인지, 전체 톤은 어떤지.
-- narrative_arc (2~4문장): 영상이 어떤 흐름으로 전개되는지 한 편의 글처럼 정리. 도입에서 무엇으로 시작해, 중간에 무엇을 보여주고, 어떻게 끝맺는지. 기승전결까지 강하지 않아도 좋고, 약한 흐름이라도 명확히 적어라. 정보가 부족하면 "느슨한 vlog 형 나열" 같이 솔직히 적어라.
-- core_message (한 줄): 이 영상이 시청자에게 결국 전하려는 핵심 메시지·인상·감정. 자막을 그대로 베끼지 말고 영상 전체에서 추출한 한 문장. 예: "혼자 떠난 짧은 여행에서 마음이 가벼워지는 순간." 약한 영상이면 "특별한 메시지 없는 일상 기록" 같이 솔직히.
-
-═══════════════════════════════
-[컷 메타데이터 — 영상의 자동 분석 결과. 정답이 아니라 참고용]
-═══════════════════════════════
-${cutLines}
-
-═══════════════════════════════
-[응답 형식]
-═══════════════════════════════
-JSON 만 출력. 다른 텍스트/마크다운/코드펜스 금지.
-
-{
-  "video_summary": string,
-  "narrative_arc": string,
-  "core_message": string,
-  "cuts": [
-    {
-      "cut_index": number,
-      "what_happens": string,
-      "caption_consistency": "match" | "loose" | "mismatch" | "no_caption",
-      "caption_plausibility": "ok" | "weak" | "broken" | "no_caption",
-      "narration_guidance": string,
-      "is_broll": boolean,
-      "arc_role": "hook" | "build" | "reveal" | "outro" | "broll"
-    }
-  ]
-}
-
-- 모든 컷을 빠짐없이 포함.
-- 자막이 없는 컷은 caption_consistency / caption_plausibility 둘 다 "no_caption".
-- arc_role 은 영상 전체 흐름 안에서 그 컷의 역할. is_broll=true 인 컷은 보통 arc_role="broll".
-- 절대 segments / narration text / 음성 대본을 만들지 마라. 이 단계는 평가만 한다.`;
-}
-
 // ============================================================
-// 나레이션 개요 (TTS 합성 전 생성) — Stage 1 끝난 뒤 호출.
+// 나레이션 개요 (TTS 합성 전 생성) — source='generate' genMode='auto' 에서 호출.
 // 입력:
-//   - cuts: edit-plan 각 컷의 (output_start, output_end, spoken, scene, caption_text)
+//   - cuts: edit-plan 각 컷의 (output_start, output_end, spoken, scene, caption_text, …)
 //   - userDirectionBlock: styleBrief + styleNote
-//   - evaluation: buildVideoEvaluationPrompt 의 결과 (선택)
 // 출력 JSON:
 //   { segments: [{ cut_index, output_start, output_end, text }] }
 // 핵심 제약:
 //   - 인접 segment 끼리 시간이 겹치지 않음.
-//   - 한 segment 길이(초) * 5.5 자 이하 (한국어 발화 속도).
-//   - 각 cut 마다 0~1개 segment. 자막이 빈 컷은 segment 생략 가능.
+//   - 한 segment 길이(초) * 5자 이하 (한국어 발화 속도).
+//   - 각 cut 마다 0~1개 segment. b-roll/침묵 컷은 segment 생략 가능.
 // ============================================================
 export function buildNarrationOutlinePrompt(args: {
   userDirectionBlock: string;
   totalDuration: number;
-  videoAttached?: boolean;     // 영상이 첨부됐는지 (true 면 영상 우선 평가 지침 활성)
-  sourceContext?: string;      // 소스 영상 전체 컨텍스트 (선택)
-  evaluation?: {
-    video_summary?: string;
-    narrative_arc?: string;
-    core_message?: string;
-    cuts?: Array<{
-      cut_index: number;
-      what_happens?: string;
-      caption_consistency?: string;
-      caption_plausibility?: string;
-      narration_guidance?: string;
-      is_broll?: boolean;
-      arc_role?: string;
-    }>;
-  };
   cuts: TtsCutMeta[];
 }): string {
-  const evalByIdx = new Map<number, any>();
-  for (const e of args.evaluation?.cuts || []) {
-    if (typeof e.cut_index === 'number') evalByIdx.set(e.cut_index, e);
-  }
-
   const cutLines = args.cuts.map(c => {
     const dur = (c.output_end - c.output_start).toFixed(2);
     const maxChars = Math.floor((c.output_end - c.output_start) * 5);
-    const ev = evalByIdx.get(c.cut_index);
-    // 평가 결과가 있으면 그것이 1순위 정보. 풍부한 source 메타도 같이 표시.
     const srcBits: string[] = [];
     if (c.subject) srcBits.push(`subject="${c.subject.slice(0, 60)}"`);
     if (c.shot_type) srcBits.push(`shot=${c.shot_type}`);
@@ -847,55 +833,19 @@ export function buildNarrationOutlinePrompt(args: {
     if (c.spoken) srcBits.push(`spoken="${c.spoken.slice(0, 80)}"`);
     if (c.scene) srcBits.push(`scene="${c.scene.slice(0, 100)}"`);
     const srcSuffix = srcBits.length > 0 ? ` | ${srcBits.join(' | ')}` : '';
-    const evalBits = ev
-      ? ` | role=${ev.arc_role || '?'} | what="${(ev.what_happens || '').slice(0, 140)}" | caption_cons=${ev.caption_consistency || '?'} caption_plaus=${ev.caption_plausibility || '?'} | guide="${(ev.narration_guidance || '').slice(0, 100)}"${ev.is_broll ? ' | BROLL' : ''}`
-      : '';
-    return `cut ${c.cut_index} [${c.output_start.toFixed(2)}~${c.output_end.toFixed(2)}s, ${dur}s, max ${maxChars}자] caption="${c.caption_text || ''}"${evalBits}${srcSuffix}`;
+    return `cut ${c.cut_index} [${c.output_start.toFixed(2)}~${c.output_end.toFixed(2)}s, ${dur}s, max ${maxChars}자] caption="${c.caption_text || ''}"${srcSuffix}`;
   }).join('\n');
-
-  const evaluationProvided = !!args.evaluation && Array.isArray(args.evaluation.cuts) && args.evaluation.cuts.length > 0;
-  const summaryBits: string[] = [];
-  if (evaluationProvided && args.evaluation?.video_summary) {
-    summaryBits.push(`■ 영상 요약\n${args.evaluation.video_summary}`);
-  }
-  if (evaluationProvided && args.evaluation?.narrative_arc) {
-    summaryBits.push(`■ 서사 흐름 (이 흐름을 따라 나레이션이 한 편의 글처럼 이어지도록 작성)\n${args.evaluation.narrative_arc}`);
-  }
-  if (evaluationProvided && args.evaluation?.core_message) {
-    summaryBits.push(`■ 핵심 메시지 (전체 나레이션의 목적지. 도입에서 암시하고 마무리에서 자연스럽게 닿게 한다 — 그대로 베끼지 말 것)\n${args.evaluation.core_message}`);
-  }
-  const summaryBlock = summaryBits.length > 0
-    ? `\n═══════════════════════════════\n[영상 전체 — 1단계 평가 결과]\n═══════════════════════════════\n${summaryBits.join('\n\n')}\n`
-    : '';
-  const ctxBlock = args.sourceContext
-    ? `\n═══════════════════════════════\n[소스 영상 전체 컨텍스트]\n═══════════════════════════════\n${args.sourceContext.trim()}\n`
-    : '';
-
-  const sourceModeBlock = evaluationProvided
-    ? `※ 컷별로 이미 1단계에서 영상을 보고 평가한 결과가 함께 주어진다 (what / caption_cons / caption_plaus / guide / BROLL). 그 평가를 신뢰하고 그 위에서 나레이션을 작성해라. caption_cons=mismatch 또는 caption_plaus=broken 인 컷은 자막을 무시하고 what_happens 만 활용. BROLL 표시된 컷은 가급적 segment 생략.\n`
-    : args.videoAttached
-      ? `※ 영상(cut.mp4) 이 첨부됐다. 컷 메타데이터(아래)가 실제 영상 내용과 다르거나 빠진 정보가 있으면 영상에서 본 내용을 우선해라.\n`
-      : '';
 
   return `너는 짧은 영상의 나레이션 작가다.
 아래는 자동 편집된 영상 (총 ${args.totalDuration.toFixed(2)}초) 의 컷 구성이다.
-${sourceModeBlock}각 컷의 시각 내용·자막·1단계 평가를 종합해 자연스러운 음성 나레이션 segments 를 작성해라.
-${summaryBlock}${ctxBlock}
+각 컷의 시각 내용·자막을 종합해 자연스러운 음성 나레이션 segments 를 작성해라.
+
 ═══════════════════════════════
 [작성 원칙]
 ═══════════════════════════════
-- **전체 segments 는 한 편의 짧은 글처럼 이어지게 작성**. 위 narrative_arc 흐름을 따라 도입(hook)에서 흥미를 끌고, 중간(build)에서 보여주거나 설명하고, 끝(reveal/outro)에서 메시지를 마무리한다. 기승전결까지 강하지 않아도 좋지만, **컷별 독립 묘사 나열이 되지 않게** 유의.
-- core_message 가 주어졌다면 그것을 영상의 목적지로 삼는다. 도입 segment 에서 살짝 암시하고 마무리(reveal/outro) segment 에서 자연스럽게 도달하게 구성. core_message 문장을 그대로 베껴 읽지 말고 다른 단어로 풀어쓰기.
-- 각 컷의 arc_role 을 참고해 톤을 맞춘다.
-   · role=hook    → 짧고 강한 한 마디. 호기심 또는 결론 한 줄.
-   · role=build   → 정보·맥락·감각 묘사. 흐름을 이어주는 연결구 활용.
-   · role=reveal  → 핵심 메시지·전환. 무게감 있는 한 문장.
-   · role=outro   → 여운·CTA·요약. 마무리 톤.
-   · role=broll   → 가급적 침묵. 꼭 필요하면 매우 짧은 한 단어 정도.
+- **전체 segments 는 한 편의 짧은 글처럼 이어지게 작성**. 도입(hook)에서 흥미를 끌고, 중간(build)에서 보여주거나 설명하고, 끝(outro)에서 마무리한다. **컷별 독립 묘사 나열이 되지 않게** 유의.
 - 자막을 그대로 읽지 마라. 자막은 시각 채널, 나레이션은 별도 청각 채널이다.
-- 1단계 평가에서 caption_cons=mismatch / caption_plaus=broken 으로 표시된 컷은 자막 문구를 신뢰하지 말고 what_happens 만 활용해라.
-- BROLL 컷은 비워두는 게 자연스럽다 (segment 생략).
-- narration_guidance 가 "silence" 면 그 컷에 segment 만들지 마라.
+- 정보 없는 분위기/연결(b-roll) 컷은 비워두는 게 자연스럽다 (segment 생략).
 
 ═══════════════════════════════
 [컷 구성]

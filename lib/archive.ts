@@ -270,6 +270,63 @@ export type FetchedBgm = {
   candidate_pool_size: number;
 };
 
+// ============================================================
+// 후보 목록 (다운로드 없이) — UI 의 BGM 선택 화면용.
+// 사용자가 들어보고 고를 수 있도록 mp3 url 도 같이 넘긴다.
+// ============================================================
+export type BgmCandidate = {
+  identifier: string;
+  title?: string;
+  source_url: string;       // mp3 직접 url (Archive 는 CORS 헤더 줌)
+  duration_sec: number;
+  size_bytes: number;
+  query_used: string;
+};
+
+export async function fetchBgmCandidates(
+  profile: BgmProfile,
+  maxCandidates = 6,
+): Promise<BgmCandidate[]> {
+  const queries = buildQueriesFromProfile(profile);
+  const out: BgmCandidate[] = [];
+  const seen = new Set<string>();
+
+  for (const q of queries) {
+    if (out.length >= maxCandidates) break;
+    let items: ArchiveItem[] = [];
+    try { items = await searchAudio(q, 20); } catch { continue; }
+    if (items.length === 0) continue;
+
+    const ranked = items
+      .map(item => ({ item, score: scoreArchiveItem(item, profile) }))
+      .sort((a, b) => b.score - a.score || (b.item.downloads || 0) - (a.item.downloads || 0))
+      .map(x => x.item);
+
+    for (const item of ranked) {
+      if (out.length >= maxCandidates) break;
+      if (seen.has(item.identifier)) continue;
+      let file: ArchiveFile | null = null;
+      try { file = await pickMp3File(item.identifier, profile); } catch { /* next */ }
+      if (!file) continue;
+      const url = `${DL_URL}/${encodeURIComponent(item.identifier)}/${encodeURIComponent(file.name)}`;
+      out.push({
+        identifier: item.identifier,
+        title: item.title,
+        source_url: url,
+        duration_sec: parseLengthToSec(file.length),
+        size_bytes: parseInt(file.size || '0', 10) || 0,
+        query_used: q,
+      });
+      seen.add(item.identifier);
+    }
+  }
+  return out;
+}
+
+export async function downloadBgmTrack(sourceUrl: string, destPath: string): Promise<void> {
+  await downloadFile(sourceUrl, destPath);
+}
+
 export async function fetchBgmFromArchive(
   profile: BgmProfile | string,    // 후방 호환을 위해 mood 문자열도 받음
   saveDir: string,
