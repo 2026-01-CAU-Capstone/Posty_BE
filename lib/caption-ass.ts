@@ -64,6 +64,9 @@ export type CaptionLayer = {
   horizontal_align?: string;    // left | center | right
   size_level?: string;          // small | medium | large | huge
   color_hex?: string;
+  // 한 자막 안에서 색이 중간에 바뀌는 경우(예: "오늘 [특가] 세일"에서 특가만 빨강).
+  // runs 를 순서대로 이으면 text 와 같아야 한다. 색이 일정하면 비우거나 1개.
+  color_runs?: Array<{ text: string; color_hex: string }>;
   emphasis?: string;            // regular | bold | black
   italic?: boolean;
   font_category?: string;
@@ -120,6 +123,8 @@ export type CutInput = {
   start: number;     // output 타임라인 기준 시작 (초)
   end: number;       // 끝 (초)
   layers: CaptionLayer[];
+  // 이 컷의 주피사체 세로 위치 (0=위 ~ 1=아래). 단일 자막을 주체 반대편에 두기 위해 사용.
+  subjectCenterY?: number;
 };
 
 type Prepared = {
@@ -160,6 +165,7 @@ export function buildCaptionAss(cuts: CutInput[], globalStyle: GlobalCaptionStyl
     if (sanitized.length === 0) continue;
 
     const prepared = sanitized.map(l => prepareLayer(l, g));
+    applySubjectAwarePosition(prepared, cut.subjectCenterY);
     placeLayers(prepared);
 
     const dur = cut.end - cut.start;
@@ -242,6 +248,14 @@ export function preserveLayerDesign(raw: any): Partial<CaptionLayer> {
   const ea = str(raw.entry_animation);
   if (ea) out.entry_animation = ea.toLowerCase();
 
+  // 인라인 색 runs — {text, color_hex} 만 추려 보존 (2개 이상 의미 있을 때).
+  if (Array.isArray(raw.color_runs)) {
+    const runs = raw.color_runs
+      .map((r: any) => ({ text: String(r?.text ?? ''), color_hex: str(r?.color_hex) || '' }))
+      .filter((r: { text: string; color_hex: string }) => r.text.length > 0 && r.color_hex.length > 0);
+    if (runs.length >= 2) out.color_runs = runs;
+  }
+
   return out;
 }
 
@@ -256,6 +270,10 @@ export function sanitizeLayer(raw: any, global: GlobalCaptionStyle): CaptionLaye
 
   const out: CaptionLayer = {
     text,
+    // 인라인 색 runs — {text,color_hex} 2개 이상일 때만 유지 (렌더 시 grapheme 매핑).
+    color_runs: Array.isArray(raw.color_runs) && raw.color_runs.length >= 2
+      ? raw.color_runs.filter((r: any) => r && typeof r.text === 'string' && typeof r.color_hex === 'string')
+      : undefined,
     position: String(raw.position || 'bottom').toLowerCase(),
     horizontal_align: String(raw.horizontal_align || 'center').toLowerCase(),
     size_level: String(raw.size_level || global.size_level || 'medium').toLowerCase(),
@@ -381,6 +399,20 @@ function prepareLayer(layer: CaptionLayer, global: GlobalCaptionStyle): Prepared
     x: SCRIPT_W / 2,
     y: SCRIPT_H - V_MARGIN,
   };
+}
+
+// ============================================================
+// 주체 기준 자막 위치 — 컷의 주피사체(subject_center_y)를 가리지 않도록
+// 단일 자막을 주체 반대편(위/아래)에 배치. 보여주려는 부분 위에 글자가
+// 겹치지 않게 한다. (멀티 layer 컷은 ref 디자인을 그대로 두어 충돌 방지)
+// ============================================================
+function applySubjectAwarePosition(items: Prepared[], subjectCenterY?: number): void {
+  if (items.length !== 1) return;
+  if (typeof subjectCenterY !== 'number' || !Number.isFinite(subjectCenterY)) return;
+  const p = items[0];
+  if (subjectCenterY < 0.4) p.position = 'bottom';        // 주체가 위 → 자막 아래
+  else if (subjectCenterY > 0.6) p.position = 'top';      // 주체가 아래 → 자막 위
+  // 중앙(0.4~0.6)이면 ref 위치 유지
 }
 
 // ============================================================
@@ -575,9 +607,46 @@ function buildDialogueLine(styleName: string, p: Prepared, start: number, end: n
   }
 
   const override = `{${tags.join('')}}`;
-  const text = p.lines.map(sanitizeAssLine).join('\\N');
+  const text = renderCaptionText(p.lines, layer);
 
   return `Dialogue: 0,${assTime(start)},${assTime(end)},${styleName},,0,0,0,,${override}${text}`;
+}
+
+// 본문 렌더 — 인라인 색 runs 가 있으면 grapheme 단위로 색을 입히고, 없으면 단색.
+//   color_runs 를 이어붙인 비공백 grapheme 순서대로 색을 매핑 → wrap 으로 줄이 나뉘어도
+//   (줄바꿈 시 공백만 변함) 비공백 문자 순서는 보존되므로 정확히 따라간다.
+function renderCaptionText(lines: string[], layer: CaptionLayer): string {
+  const runs = layer.color_runs;
+  if (!runs || runs.length < 2) return lines.map(sanitizeAssLine).join('\\N');
+
+  const colorSeq: string[] = [];
+  for (const r of runs) {
+    for (const g of graphemes(String(r.text || ''))) {
+      if (/^\s+$/.test(g)) continue;
+      colorSeq.push(r.color_hex);
+    }
+  }
+  if (colorSeq.length === 0) return lines.map(sanitizeAssLine).join('\\N');
+
+  let nsIdx = 0;
+  let curColor = '';
+  const out: string[] = [];
+  for (let li = 0; li < lines.length; li++) {
+    if (li > 0) out.push('\\N');
+    for (const g of graphemes(lines[li])) {
+      if (/^\s+$/.test(g)) { out.push(escapeAssChar(g)); continue; }
+      const color = colorSeq[Math.min(nsIdx, colorSeq.length - 1)];
+      nsIdx++;
+      if (color !== curColor) { out.push(`{\\1c${hexToAss(color)}&}`); curColor = color; }
+      out.push(escapeAssChar(g));
+    }
+  }
+  return out.join('');
+}
+
+// 단일 grapheme 의 ASS 제어문자 무력화 (sanitizeAssLine 의 char 버전, trim 없음).
+function escapeAssChar(g: string): string {
+  return g.replace(/\\/g, '＼').replace(/\{/g, '｛').replace(/\}/g, '｝');
 }
 
 function slideOffset(anim: string): { dx: number; dy: number } | null {

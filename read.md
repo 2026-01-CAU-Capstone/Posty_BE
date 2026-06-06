@@ -208,7 +208,8 @@ Gemini 2.5/3 Flash 는 thinking 모델이라 `maxOutputTokens` 안에 추론 토
      (f) 페이지/날짜 헤더 (`1/5`, `Day 3`, `EP.02`). 한 layer 에 콘텐츠+메타 섞이면 콘텐츠만 추출
    - **size_level 강제 복사** — 프롬프트 4-bis 작성 지침: `matched_ref_layers` 의 `size_level` 을 그대로 카피, 임의 small 폴백 금지. 렌더 단계 fit 이 폰트만 줄임
 7. **렌더** (FFmpeg, [lib/stages/stage1.ts:975-1082](lib/stages/stage1.ts:975)):
-   - 영상 소스: `-ss → trim → scale(+8px) → crop(9:16, subject_center 기반)` → 세그먼트 mp4
+   - 영상 소스: `-ss → trim → scale(+8px) → crop(9:16, subject_center 기반)` → **punch-in 줌**(zoom>1 이면 가운데 추가 crop+scale) → 세그먼트 mp4
+     - `zoom` 은 ref shot_type 기반 (`zoomForShotType`: close_up 1.30 / product 1.25 / selfie 1.15 / medium 1.12 / 그 외 1.0, 화질 위해 최대 1.3). edit-plan item 에 저장.
    - 이미지 소스: `-loop 1 -i img -f lavfi -i anullsrc` + zoompan (인덱스로 순환: zoom_in / pan_right / zoom_out / pan_left / ken_burns_diagonal, subject 위치 기반 보정)
    - 모든 세그먼트 → `concat demuxer` → `cut.mp4`
 
@@ -255,6 +256,8 @@ Gemini 2.5/3 Flash 는 thinking 모델이라 `maxOutputTokens` 안에 추론 토
 | 예상 | 10~30초 |
 
 **로직:**
+0. **인라인 색 (`color_runs`)** — 한 자막 안에서 색이 중간에 바뀌면(예: "오늘 [특가] 세일") `color_runs[{text,color_hex}]` 로 분석·보존, 렌더 시 grapheme 단위로 ASS `\1c` 인라인 색 적용 (wrap 줄바꿈에도 비공백 문자 순서로 정확히 매핑).
+0-bis. **주체 기준 위치** — 단일 자막 컷은 `subject_center_y` 로 주피사체를 피해 배치 (주체가 위면 자막 아래, 아래면 위). 멀티 layer 컷은 ref 디자인 유지.
 1. cut별 layers 결정 — `planned_caption_layers` 우선, 없으면 `ref_caption_layers` 폴백
 2. layers 총합 0이면 video stream을 그대로 copy
 3. 그 외: `buildCaptionAss(cuts, globalStyle)` ([lib/caption-ass.ts](lib/caption-ass.ts)) — 단일 .ass 문서 생성
