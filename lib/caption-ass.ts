@@ -60,7 +60,8 @@ const LETTER_SPACING_EM: Record<string, number> = { tight: -0.02, normal: 0, wid
 // ============================================================
 export type CaptionLayer = {
   text: string;
-  position?: string;            // top | center | bottom
+  position?: string;            // top | center | bottom (거친 단계)
+  vertical_ratio?: number;      // 0.0(맨 위)~1.0(맨 아래) — 정밀 세로 위치. 있으면 이걸 우선해 배치.
   horizontal_align?: string;    // left | center | right
   size_level?: string;          // small | medium | large | huge
   color_hex?: string;
@@ -248,6 +249,10 @@ export function preserveLayerDesign(raw: any): Partial<CaptionLayer> {
   const ea = str(raw.entry_animation);
   if (ea) out.entry_animation = ea.toLowerCase();
 
+  // 정밀 세로 위치 (0~1) — 있으면 보존해 렌더가 고정 마진 대신 이 비율로 배치.
+  const vr = Number(raw.vertical_ratio);
+  if (Number.isFinite(vr) && vr >= 0 && vr <= 1) out.vertical_ratio = vr;
+
   // 인라인 색 runs — {text, color_hex} 만 추려 보존 (2개 이상 의미 있을 때).
   if (Array.isArray(raw.color_runs)) {
     const runs = raw.color_runs
@@ -268,12 +273,15 @@ export function sanitizeLayer(raw: any, global: GlobalCaptionStyle): CaptionLaye
   const text = String(raw.text || '').trim();
   if (!text) return null;
 
+  const vr = Number(raw.vertical_ratio);
   const out: CaptionLayer = {
     text,
     // 인라인 색 runs — {text,color_hex} 2개 이상일 때만 유지 (렌더 시 grapheme 매핑).
     color_runs: Array.isArray(raw.color_runs) && raw.color_runs.length >= 2
       ? raw.color_runs.filter((r: any) => r && typeof r.text === 'string' && typeof r.color_hex === 'string')
       : undefined,
+    // 정밀 세로 위치 (0~1) — 있으면 placeLayers 가 고정 마진 대신 이 비율로 배치.
+    vertical_ratio: (Number.isFinite(vr) && vr >= 0 && vr <= 1) ? vr : undefined,
     position: String(raw.position || 'bottom').toLowerCase(),
     horizontal_align: String(raw.horizontal_align || 'center').toLowerCase(),
     size_level: String(raw.size_level || global.size_level || 'medium').toLowerCase(),
@@ -408,11 +416,19 @@ function prepareLayer(layer: CaptionLayer, global: GlobalCaptionStyle): Prepared
 // ============================================================
 function applySubjectAwarePosition(items: Prepared[], subjectCenterY?: number): void {
   if (items.length !== 1) return;
+  // 원본의 정밀 세로위치(vertical_ratio)가 있으면 그걸 우선 — 주체 스냅으로 덮지 않는다.
+  if (layerVRatio(items[0].layer) !== null) return;
   if (typeof subjectCenterY !== 'number' || !Number.isFinite(subjectCenterY)) return;
   const p = items[0];
   if (subjectCenterY < 0.4) p.position = 'bottom';        // 주체가 위 → 자막 아래
   else if (subjectCenterY > 0.6) p.position = 'top';      // 주체가 아래 → 자막 위
   // 중앙(0.4~0.6)이면 ref 위치 유지
+}
+
+// 유효한 vertical_ratio(0~1) 면 반환, 아니면 null.
+function layerVRatio(layer: CaptionLayer): number | null {
+  const v = Number(layer.vertical_ratio);
+  return Number.isFinite(v) && v >= 0 && v <= 1 ? v : null;
 }
 
 // ============================================================
@@ -424,9 +440,20 @@ function placeLayers(items: Prepared[]): void {
     p.x = anchorX(p.hAlign);
   }
 
-  const top = items.filter(p => p.position === 'top');
-  const center = items.filter(p => p.position === 'center');
-  const bottom = items.filter(p => p.position === 'bottom');
+  // ── 원본 정밀 세로위치가 있는 layer: 비율 그대로 배치 (고정 마진 스냅 회피) ──
+  // 블록 세로 중심을 vertical_ratio*화면높이 에 둠 → middle-row anchor 사용.
+  const ratioItems = items.filter(p => layerVRatio(p.layer) !== null);
+  for (const p of ratioItems) {
+    const v = layerVRatio(p.layer)!;
+    p.anchor = 4 + (p.hAlign === 'left' ? 0 : p.hAlign === 'right' ? 2 : 1); // 4/5/6 = vertical center
+    p.y = Math.round(v * SCRIPT_H);
+  }
+
+  // 나머지(정밀 위치 없음)만 기존 top/center/bottom 고정 스택으로.
+  const rest = items.filter(p => layerVRatio(p.layer) === null);
+  const top = rest.filter(p => p.position === 'top');
+  const center = rest.filter(p => p.position === 'center');
+  const bottom = rest.filter(p => p.position === 'bottom');
 
   // 인접 layer 의 평균 fontSize 에 비례한 동적 gap (큰 자막은 더 넓은 간격).
   const gapBetween = (a: Prepared, b: Prepared) =>
