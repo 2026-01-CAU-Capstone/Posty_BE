@@ -10,7 +10,7 @@
 
 ```
 posty-prototype/
-├── frontend/           Vite + React UI (4-step 마법사: 레퍼런스 → 소스 → 옵션 → 생성)
+├── frontend/           Vite + React UI (마법사: 레퍼런스 → 소스 → 분석 → 옵션 → 편집 → BGM → 완성)
 ├── backend/            Hono API + in-process job queue (lib/ 파이프라인을 비동기로 실행)
 ├── lib/                편집 파이프라인 (Stage 0~4) — backend가 import해서 사용
 │   └── stages/         stage0.ts ~ stage4.ts
@@ -114,7 +114,7 @@ s4 = 50  + 2.4 * outDurEst               // BGM 다운로드 + 믹스
 1. `analyzeVideoStructured()` 1차 — 메인 분석 (컷·색감·오디오·텍스트 종합). Pro 429/5xx → Flash 폴백.
 2. `analyzeVideoStructured()` 2차 — 텍스트 전용 (한글 OCR 보강). `mergeTextFocusedIntoSpec()`로 `shots[].caption_layers` / `caption_pattern` 덮어쓰기.
 3. `normalizeShot()` — index/start/end/duration/shot_type/subject/scene_description/composition/camera_motion/transition_to_next/caption_layers/required_tags 정규화.
-4. `normalizeLayer()` — text가 빈 layer도 보존 (스타일 정보용). position·align·size·color·emphasis·italic·font_category·font_personality·role·tone.
+4. `normalizeLayer()` — text가 빈 layer도 보존 (스타일 정보용). 기본 필드(position·align·size·color·emphasis·italic·font_category·font_personality·role·tone) + **디자인 필드 전부 보존** (`preserveLayerDesign`: outline·shadow·background_box·gradient·glow·letter_spacing·entry_animation). ⚠ 예전엔 여기서 디자인 필드를 버려 레퍼런스 자막 "형식 복사"가 안 됐다 — 렌더러(caption-ass)는 다 지원하는데 normalize 가 중간에서 누락. Stage 1 `normalizeLayers` 도 동일하게 보존하도록 수정. `CaptionLayer` 타입은 caption-ass 와 단일 소스로 통일.
 5. **`stripWatermarkLayers()` — 워터마크/지속 오버레이 제거 (근본 차단).** 출처 핸들·계정명·워터마크·구독 안내처럼 영상 콘텐츠가 아니라 운영용으로 고정된 텍스트를 `shots[].caption_layers` 에서 통째로 제거. caption planning 의 LLM 판단에만 맡기지 않고 spec 단계에서 차단. 제거 시 `raw-api-responses.json` 에 `kind: "watermark_stripped"` 기록.
    - 판정 3신호: (1) 키워드 (`@handle`, URL, `출처`/`credit`, `follow`/`subscribe`/`구독`/`팔로우`, `#해시태그` 단독) (2) **코너(top\|bottom + left\|right) + (작은 크기 \| label/decoration 역할)** — 전형적 워터마크 위치 (3) 거의 모든 컷에 동일 텍스트 반복 + 형태 신호 + 박스 없음 → 지속 오버레이
    - 보존: 중앙·큰 글씨·박스 배경 hook 은 가게명이 들어가도 콘텐츠로 보고 유지 (반복만으로는 제거 안 함)
@@ -341,21 +341,22 @@ TTS 트랙은 `atempo → dynaudnorm(f=500:g=15:p=0.9:m=8) → volume=1.30 → a
 
 ## 5. 프론트엔드 (Vite + React)
 
-### 5.1 마법사 5단계 ([frontend/src/App.tsx](frontend/src/App.tsx))
+### 5.1 마법사 단계 ([frontend/src/App.tsx](frontend/src/App.tsx))
 
 ```
-ref (레퍼런스) → sources (소스) → waiting (분석 대기) → options (옵션) → run (생성)
+ref (레퍼런스) → sources (소스) → waiting (분석) → options (옵션)
+   → edit (컷+자막, stages 1~3) → bgm (BGM 입히기) → final (완성, stage 4)
 ```
+
+생성은 **두 개의 잡으로 분리**된다: 먼저 컷편집+자막(stages 1~3)을 만들어 결과를 보여주고, 사용자가 그 결과를 보며 BGM 을 고른 뒤 stage 4(BGM/음성)를 따로 돌린다. (`mainJob` 을 `genPhase: 'edit' | 'final'` 로 재사용)
 
 - **ref**: IG URL 또는 파일 업로드. "분석 시작하고 다음 →" 누르면 `POST /api/projects` + 업로드 + `POST /api/run mode=stage stage=0` → 즉시 sources 단계로. Stage 0 백그라운드 분석 중에도 다음 화면에서 작업 가능
-- **sources**: **드래그&드롭 + 클릭 시 파일 탐색기** 드롭존. `multiple` + 영상 확장자 필터 (`.mp4/.mov/.webm/.mkv/.m4v/.avi`). 여러 번 누적 추가. IG URL 입력 제거 (사용자가 본인이 찍은 영상만 올린다는 가정)
-- **waiting**: Stage 0 polling + 실측 진행률 바 (`phaseProgress(from=0, to=0)` 가 `estimate.perStage[0]` 기준 elapsed 로 줄어듦). 완료되면 자동으로 `POST /api/style-suggest` 호출 → **마스코트 말풍선** 으로 한 줄 요약 표시 (예: "오! 한강 뷰를 보며 시원한 맥주를 즐기는 청량한 영상이네요!")
-- **options**: `style-suggest` 의 `brief` 로 미리 채워짐
-  - **태그 입력 (`ChipSingle` / `ChipMulti`)** — tone/purpose는 단일 선택, keywords/must_include는 다중 선택. 클릭으로 활성/비활성 토글, `+ 추가` → 인라인 input 팝업 (Enter 확정, ESC 취소), 비어있으면 반투명 이탤릭 예시 placeholder
-  - caption_language/density는 기존 select 유지 (enum 4~5개라 더 명확)
-  - extra_notes 자유 텍스트. styleNote는 extra_notes로 통합 (이전 별개 필드 제거)
-- **run**: ✨ 영상 생성 → `POST /api/run mode=all from=1 to=4`. 진행률 + ETA + Posty 애니메이션 + **디버그 로그 토글**
-  - 완료 화면에 ⬇ 다운로드 / **"옵션 수정해서 다시 생성"** / "새 영상 만들기" 3개 버튼
+- **sources**: **드래그&드롭 + 클릭 시 파일 탐색기** 드롭존. `multiple` + 영상 확장자 필터. 여러 번 누적 추가.
+- **waiting**: Stage 0 polling + 실측 진행률 바. 완료되면 자동으로 `POST /api/style-suggest` → **마스코트 말풍선**(summary) + 항목별 분석(analysis) 표시.
+- **options**: `style-suggest` 의 `brief` 로 미리 채워짐 (태그 입력 `ChipSingle`/`ChipMulti`) + 오디오 밸런스 + TTS 옵션. **이때 캐러셀 프레임을 미리 추출·캐시** (`getPreviewFrames`). "편집 시작 (컷+자막) →" 누르면 설정 저장 + `POST /api/run mode=all from=1 to=3` → edit 단계.
+- **edit**: stages 1~3 진행률(`phaseProgress(from=1,to=3)`) + 캐러셀. 완료되면 `captioned.mp4` URL 을 가져와 bgm 단계로 자동 전환.
+- **bgm**: 편집 결과(`captioned.mp4`) 영상 미리보기 + 추천 음원 후보. 영상을 재생해두고 음원을 들어보며 선택. "이 음원으로 완성" → `pickBgm` + `POST /api/run mode=all from=4 to=4` → final 단계.
+- **final**: stage 4 진행률(`phaseProgress(from=4,to=4)`) → 완료 시 결과(`final.mp4`). ⬇ 다운로드 / "옵션 수정해서 다시 생성" / "새 영상 만들기".
 
 ### 5.2 디버그 로그 (`DebugLog`)
 

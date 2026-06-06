@@ -24,6 +24,7 @@ import { cosineSim, embedTexts } from '../openai';
 import { buildCaptionPlanningPrompt, buildImageSourceDescriptionPrompt, buildSourceDescriptionPrompt, buildSourceDescriptionPromptMultipart, styleNoteBlock } from '../prompts';
 import { briefToPromptBlock, readStyleBrief } from '../style-brief';
 import { reduceSourceShots, ReduceCandidate } from '../source-reduce';
+import { CaptionLayer, preserveLayerDesign } from '../caption-ass';
 import { config } from '../config';
 
 const OUT_W = 1080;
@@ -73,19 +74,9 @@ type SourceVideo = {
   is_image: boolean;       // 정지 이미지 소스 여부 (true 면 단일 still shot)
 };
 
-export type CaptionLayer = {
-  text: string;
-  position: string;              // top | center | bottom
-  horizontal_align: string;      // left | center | right
-  size_level: string;            // small | medium | large | huge
-  color_hex: string;             // #RRGGBB
-  emphasis: string;              // regular | bold | black
-  italic: boolean;               // 굵기와 직교한 기울임 여부
-  font_category: string;         // sans | serif | handwritten | condensed | rounded | display
-  font_personality: string;      // modern | vintage | playful | elegant | bold_impact | minimal | retro | handwritten_neat | handwritten_brush | display_decorative
-  role: string;
-  tone: string;
-};
+// CaptionLayer 타입은 caption-ass.ts(렌더러)와 단일 소스로 통일한다.
+// (예전엔 여기서 기본 11개 필드만 가진 중복 타입을 따로 둬서, 디자인 필드가
+//  normalize 단계에서 버려지는 버그의 원인이 됐다.)
 
 type EditPlanItem = {
   // 어떤 ref shot 의 STYLE 을 빌렸는지
@@ -900,6 +891,9 @@ function normalizeLayers(raw: any): CaptionLayer[] {
       font_personality: String(r.font_personality || '').toLowerCase(),
       role: String(r.role || 'none').toLowerCase(),
       tone: String(r.tone || 'none').toLowerCase(),
+      // 외곽선/그림자/박스/그라데이션/글로우/자간/등장애니메이션 — 렌더러가 쓰는
+      // 디자인 필드를 보존해야 레퍼런스 자막 형식이 결과물까지 전달된다.
+      ...preserveLayerDesign(r),
     });
   }
   return out;
