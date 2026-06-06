@@ -52,9 +52,11 @@ frontend는 HTTP로만 backend와 통신. `VITE_API_BASE`로 주소 변경 가�
 | **GET/POST**  | **`/api/style-suggest`** | **Stage 0.5 — Stage 0 끝난 뒤 옵션 자동 추천 캐시 조회/생성. POST `{force:true}` 면 재생성** |
 | POST | `/api/style-note` | 자유 스타일 노트 저장 |
 | POST | `/api/style-brief` | 구조화된 스타일 브리프 저장 |
-| POST | `/api/tts-config` | TTS 설정 저장 (enabled/voice/mode) |
+| POST | `/api/tts-config` | TTS 설정 저장 (`enabled` / `source:captions\|generate` / `genMode:auto\|manual` / `voice` / `script`) |
+| POST | `/api/audio-config` | 오디오 밸런스 저장 (`originalVolume:mute\|low\|full`) — 기본 mute(음원만) |
+| GET  | `/api/edit-spec` | 레퍼런스 분석 결과(edit-spec.json) 전체 반환 — 디버그 뷰어용 |
 
-추가로 [PIPELINE.md](PIPELINE.md)에 언급된 `/api/replan-captions`, `/api/tts-outline` (POST/PATCH) 가 caption 재생성 / TTS 개요 confirm 흐름을 담당.
+TTS 나레이션은 별도 confirm API 없이 Stage 4 직전 `prepareNarrationOutline`([lib/narration.ts](lib/narration.ts))이 `tts-config` 의 source/genMode 를 보고 segments 를 생성·합성한다 (옵션 선택이 곧 승인).
 
 ### 2.3 작업 큐 ([backend/src/queue.ts](backend/src/queue.ts))
 
@@ -135,7 +137,7 @@ s4 = 50  + 2.4 * outDurEst               // BGM 다운로드 + 믹스
 |---|---|
 | 입력 | `0_spec/edit-spec.json` (요약) + 사용자 styleNote |
 | API | **OpenAI Chat (`gpt-4o-mini`, `response_format: json_object`)** |
-| 출력 | `style-suggest.json` (캐시) — `{ summary, brief, generated_at, model }` |
+| 출력 | `style-suggest.json` (캐시) — `{ summary, analysis, brief, generated_at, model }` |
 | 예상 | 1~3초 |
 
 **왜 OpenAI 인가:**
@@ -145,6 +147,10 @@ Gemini 2.5/3 Flash 는 thinking 모델이라 `maxOutputTokens` 안에 추론 토
 ```ts
 {
   summary: string,              // 마스코트 한 줄 — "아 ~~한 분위기의 릴스를 올리셨군요!" 톤
+  analysis: {                   // 항목별 상세 분석 (무드·편집 리듬·색감·자막·오디오·소재 등)
+    label: string,              // 예: "무드", "편집 리듬", "색감", "자막 스타일", "오디오", "소재"
+    detail: string,             // 1~2 문장 설명
+  }[],
   brief: {
     tone: string,               // "발랄한" / "잔잔한" / ...
     purpose: string,            // "카페 홍보" / "여행 vlog" / ...
@@ -156,7 +162,7 @@ Gemini 2.5/3 Flash 는 thinking 모델이라 `maxOutputTokens` 안에 추론 토
 }
 ```
 
-프론트의 옵션 단계는 받은 `brief` 로 태그 풀을 미리 채워두고 (활성 표시), 사용자가 클릭으로 토글하거나 `+ 추가` 로 새 태그를 만들 수 있다. `summary` 는 옵션 화면 상단 마스코트 말풍선으로 표시.
+프론트의 옵션 단계는 받은 `brief` 로 태그 풀을 미리 채워두고 (활성 표시), 사용자가 클릭으로 토글하거나 `+ 추가` 로 새 태그를 만들 수 있다. `summary` 는 옵션 화면 상단 마스코트 말풍선으로, `analysis` 는 그 아래 "분석 내용 자세히 보기" 접이식 목록으로 표시. (구버전 캐시는 `analysis` 가 없을 수 있어 `readStyleSuggest` 가 `[]` 로 정규화)
 
 ### 3.2 Stage 1 — 컷편집 ([lib/stages/stage1.ts](lib/stages/stage1.ts))
 
@@ -282,16 +288,17 @@ Gemini 2.5/3 Flash 는 thinking 모델이라 `maxOutputTokens` 안에 추론 토
 
 | 항목 | 내용 |
 |---|---|
-| 입력 | `3_caption/captioned.mp4` + (선택) `bgm/` + `edit-spec.json` + `edit-plan.json` + (선택) tts outline |
-| API | Internet Archive Audio (BGM 자동), AudD (BGM 지문인식, 선택), Gemini TTS preview (선택) |
-| 출력 | `4_final/final.mp4` (+ `tts/seg_*.wav`, `bgm-identity.json`) |
-| 예상 | 10~120초 |
+| 입력 | `3_caption/captioned.mp4` + (선택) `bgm/` + `edit-spec.json` + `edit-plan.json` + `audio-config.json` + `tts-config.json` |
+| API | Internet Archive Audio (BGM 자동), AudD (BGM 지문인식, 선택), Gemini TTS preview (TTS 활성 시), OpenAI chat (TTS 자동 생성 시) |
+| 출력 | `4_final/final.mp4` (+ `tts/seg_*.wav`, `tts-outline.json`, `bgm-identity.json`) |
+| 예상 | 10~120초 (TTS 활성 시 +합성 시간) |
 
 **4단계 서브 흐름:**
 
-**(a) 원본 voice 처리** (노이즈 자동 mute):
-- `edit-plan.items[].source_has_speech === false` 인 구간을 `between(t,s,e)+...` enable expr로 mute
-- TTS 활성 → 전체 mute
+**(a) 오디오 밸런스** (`audio-config.json` 의 `originalVolume`):
+- `'mute'`(기본) → 원본 빼고 음원(BGM)만 = **음원만**. `'low'`/`'full'` → 원본 살리고 BGM 은 그 아래로 ducking
+- 원본을 살릴 때만 `source_has_speech === false` 구간을 `between(t,s,e)+...` enable expr 로 잡음 mute (단, 원본이 유일 음원이면 전체가 무음 되는 걸 막기 위해 mute 생략)
+- TTS 활성 → 원본은 항상 mute (TTS 가 메인 음성)
 
 **(b) BGM 결정** (우선순위: uploaded > Internet Archive > 없음):
 - 업로드 BGM 있으면 그것 사용
@@ -301,23 +308,24 @@ Gemini 2.5/3 Flash 는 thinking 모델이라 `maxOutputTokens` 안에 추론 토
   - **Internet Archive 자동 다운로드** ([lib/archive.ts](lib/archive.ts)) — `advancedsearch.php` 멀티팩싯 검색 + 점수화
 - `pickBgmStartOffset()` — 7~9개 후보 윈도우 `volumedetect` 측정 → intro 무음 회피하고 best start offset 선택
 
-**(c) TTS 합성** (`tts.enabled && outline.approved` 일 때만, [lib/tts.ts](lib/tts.ts) + [lib/tts-outline.ts](lib/tts-outline.ts)):
-- `approved=false` → 명시적 throw (overlap 방지)
-- 각 segment를 Gemini `gemini-2.5-flash-preview-tts` 로 호출 (Kore/Puck/Charon/Aoede/Fenrir/Leda/Orus/Zephyr)
-- 응답: base64 PCM → WAV 래핑
-- 실측 길이 > slot → `atempo` 자동 압축 (최대 2.0)
-- 보정 내역 → `outline.last_synthesis.notes` 기록
+**(c) TTS 합성** (`tts.enabled` 일 때, [lib/narration.ts](lib/narration.ts) + [lib/tts.ts](lib/tts.ts)):
+- `prepareNarrationOutline` 이 `tts-config` 의 source/genMode 로 segments 생성 (별도 approved confirm 없음 — 옵션 선택이 곧 승인):
+  - `source='captions'` → edit-plan 의 화면 자막을 그대로 / `generate'+'auto'` → OpenAI(chatJson) 작성 / `generate'+'manual'` → 사용자 대본을 컷 슬롯 길이 비례로 분배
+- 각 segment를 Gemini `gemini-2.5-flash-preview-tts` 로 합성 (Kore/Puck/Charon/Aoede/Fenrir/Leda/Orus/Zephyr) → base64 PCM → WAV
+- 실측 길이 > slot → `atempo` 자동 압축 (최대 2.0). 보정 내역 → `outline.last_synthesis.notes`
+- 키 없음/생성 실패는 영상을 죽이지 않고 TTS 없이 진행 (`tts_skipped_*` / `tts_outline_failed` 로그)
 
 **(d) FFmpeg `filter_complex` 분기:**
 
-| TTS | BGM | filter 구성 | mode |
-|---|---|---|---|
-| off | off | `[srcA] + loudnorm` | voice_only |
-| off | on  | `srcMix + bgmDuck` (sidechain by srcA, ratio=8 release=300ms) | bgm_mixed |
-| on  | off | `srcA(mute) + ttsMix + loudnorm` | tts_only |
-| on  | on  | `srcA + ttsMix + bgmDuck` (sidechain by tts, ratio=15 release=180ms) | tts_bgm_mixed |
+| TTS | BGM | originalVolume | filter 구성 | mode |
+|---|---|---|---|---|
+| off | off | (mute→full 폴백) | `[srcA] + loudnorm` | voice_only |
+| off | on  | mute | `[bgm0] + loudnorm` (원본 mute, ducking 없음, BGM=1.0) | bgm_only |
+| off | on  | low/full | `srcMix + bgmDuck` (sidechain by srcA, ratio=8 release=300ms) | bgm_mixed |
+| on  | off | — | `srcA(mute) + ttsMix + loudnorm` | tts_only |
+| on  | on  | — | `srcA + ttsMix + bgmDuck` (sidechain by tts, ratio=15 release=180ms) | tts_bgm_mixed |
 
-TTS 트랙은 `atempo → dynaudnorm(f=500:g=15:p=0.9:m=8) → volume=1.30 → adelay`. BGM 볼륨: TTS 없으면 0.55, TTS 있으면 0.13. 최종 `loudnorm=I=-14:TP=-1.5:LRA=11` (SNS / YouTube 표준).
+TTS 트랙은 `atempo → dynaudnorm(f=500:g=15:p=0.9:m=8) → volume=1.30 → adelay`. BGM 볼륨: BGM only=1.0, 원본 살림=0.55, TTS 있으면=0.13. 최종 `loudnorm=I=-14:TP=-1.5:LRA=11` (SNS / YouTube 표준).
 
 ---
 
@@ -370,9 +378,9 @@ ref (레퍼런스) → sources (소스) → waiting (분석 대기) → options 
 
 ### 5.5 Posty 컴포넌트 ([frontend/src/Posty.tsx](frontend/src/Posty.tsx))
 
-**쿼카(quokka) 마스코트** SVG (인라인, 오리지널). `variant` prop 으로 두 모습:
-- `variant="logo"` — 헤더 로고. **포스트잇을 오물오물 씹는** 쿼카 (입 + 포스트잇 `posty-chew` 애니메이션 + 부스러기 떨어짐)
-- `variant="detective"` (기본) — **돋보기 든 쿼카**. 분석 대기 / 영상 생성 화면. `working=true` 면 돋보기 스캔 애니메이션
+**클래퍼보드 마스코트** Canvas (인라인, 오리지널). `variant` prop 으로 두 모습:
+- `variant="logo"` — 헤더 로고. **클래퍼가 "딱! 딱! 딱!" 박수치는** 클래퍼보드 (`bothClap` 라우틴 + 인사·윙크·하트눈·포스트잇 들기·숨었다 빼꼼 등 다양한 라우틴 풀)
+- `variant="detective"` (기본) — **돋보기 든 클래퍼보드**. 분석 대기 / 영상 생성 화면. `working=true` 면 돋보기 스캔 애니메이션
 
 `working` prop 으로 분석/생성 중 애니메이션. 말풍선 옆 작은 사이즈(28~46px)부터 대기 화면 큰 사이즈(96px)까지 사용.
 
@@ -396,8 +404,10 @@ ref (레퍼런스) → sources (소스) → waiting (분석 대기) → options 
 | [archive.ts](lib/archive.ts) | Internet Archive Audio 검색·다운로드 (audio_profile → 멀티팩싯 쿼리 → 점수화) |
 | [bgm-identify.ts](lib/bgm-identify.ts) | AudD.io 지문인식 (선택). 식별된 상용곡 정보 + archive 검색 hint 생성 (`archiveHintsFromIdentity`) |
 | [tts.ts](lib/tts.ts) | Gemini TTS preview → PCM(base64) → WAV 래핑. 8종 prebuilt voice |
-| [tts-outline.ts](lib/tts-outline.ts) | 나레이션 segments 저장 + `validateOutline()` (겹침/길이/5자/초 검사) + `approved` 플래그 |
-| [tts-config.ts](lib/tts-config.ts) | TTS enabled/voice 저장 |
+| [narration.ts](lib/narration.ts) | `prepareNarrationOutline()` — source/genMode 에 따라 나레이션 segments 생성 (captions / generate-auto LLM / generate-manual 분배) + outline 기록 |
+| [tts-outline.ts](lib/tts-outline.ts) | 나레이션 segments 저장 + `validateOutline()` (겹침/길이 정보성 검사). `approved` 는 항상 true (옵션 선택이 곧 승인) |
+| [tts-config.ts](lib/tts-config.ts) | TTS 설정 저장 (`enabled` / `source:captions\|generate` / `genMode:auto\|manual` / `voice` / `script`) |
+| [audio-config.ts](lib/audio-config.ts) | 오디오 밸런스 저장 (`originalVolume:mute\|low\|full`) + `ORIGINAL_VOLUME_GAIN` 매핑 |
 | [ig-fetch.ts](lib/ig-fetch.ts) | ig-fetch FastAPI 클라이언트. fetch → `storage_pending` 폴링 → `stored_url` 다운로드 → 로컬 저장 |
 | [stages/stage0.ts ~ stage4.ts](lib/stages/) | 각 stage entry point. `runStage{N}(projectId)` |
 
@@ -436,8 +446,9 @@ bgm/                            (선택) 사용자 BGM 또는 archive_*.mp3 자�
 raw-api-responses.json          모든 API 호출 원본 응답 (디버깅) — appendRawResponse() 누적
 style-note.txt                  자유 텍스트 스타일 노트
 style-brief.json                구조화된 스타일 브리프
-tts-config.json                 TTS 설정 (enabled / voice / mode)
-tts-outline.json                TTS 개요 (segments + approved + last_synthesis)
+tts-config.json                 TTS 설정 (enabled / source / genMode / voice / script)
+audio-config.json               오디오 밸런스 (originalVolume: mute|low|full)
+tts-outline.json                TTS 개요 (segments + approved(항상 true) + last_synthesis)
 style-suggest.json              Stage 0.5 — 마스코트 한 줄 요약 + 옵션 자동 추천 brief (OpenAI 캐시)
 
 0_spec/
@@ -494,7 +505,7 @@ style-suggest.json              Stage 0.5 — 마스코트 한 줄 요약 + 옵�
 | ref 와 자막 폰트 인상 불일치 | `pickBundledFont` 첫 폰트 고정 (영상 내 일관성) + bold+heavy personality 에 family 단위 굵기 |
 | huge 자막의 외곽선이 가늘게 보임 | 외곽선/그림자/박스 padding 을 px 고정 → fontSize 비율로 변경 |
 | BGM intro 무음 | 7~9개 후보 윈도우의 `volumedetect` mean/max로 best start offset |
-| TTS overlap | `outline.approved` 강제 + `validateOutline()` 시간 겹침 검사 + `atempo` 자동 압축 |
+| TTS overlap | `prepareNarrationOutline` 이 captions/auto-LLM/manual 로 생성 → `sanitizeSegments()` 가 인접 겹침 클램프 + 최소 길이 컷 → 합성 후 slot 초과분 `atempo` 자동 압축 (`validateOutline()` 은 정보성 표시) |
 | TTS segment 음량 들쭉날쭉 | `dynaudnorm=f=500:g=15:p=0.9:m=8` + `volume=1.30` boost + 최종 `loudnorm=-14 LUFS` |
 | 발화 없는 컷의 환경 노이즈 | `source_has_speech=false` 구간을 `between(t,s,e)+...` enable expr로 자동 mute |
 | 9:16 crop 가장자리 검은 라인 | scale 을 +8px oversize 후 정확히 crop. 이미지 zoompan은 zoom을 1.0이 아닌 1.02부터 시작 |

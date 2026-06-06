@@ -8,6 +8,7 @@ import path from 'path';
 import fsp from 'fs/promises';
 import { referenceDir, sourcesDir } from '../../lib/paths';
 import { probeDuration } from '../../lib/ffmpeg';
+import { readTtsConfig } from '../../lib/tts-config';
 
 export type Estimate = {
   refDur: number;        // 레퍼런스 길이(초)
@@ -30,7 +31,12 @@ async function dirDuration(dir: string): Promise<{ total: number; count: number 
   return { total, count: files.length };
 }
 
-export function computeEstimate(refDur: number, srcDur: number, nSources: number): Estimate {
+export function computeEstimate(
+  refDur: number,
+  srcDur: number,
+  nSources: number,
+  ttsEnabled = false,
+): Estimate {
   // 결과물 길이: 컷 4.5s 캡 + 60s 축약 정책 → 보수적으로 min(srcDur, 75), 최소 8s.
   const outDurEst = Math.max(8, Math.min(srcDur || 0, 75));
   const up = (x: number) => Math.ceil(x * SAFETY);
@@ -41,7 +47,10 @@ export function computeEstimate(refDur: number, srcDur: number, nSources: number
   const s1 = up(40  + 4.0 * srcDur + 18 * nSources);  // 디코드 + Gemini 소스별 + 렌더
   const s2 = up(20  + 2.0 * outDurEst);               // 색보정
   const s3 = up(20  + 1.6 * outDurEst);               // 자막 (libass)
-  const s4 = up(50  + 2.4 * outDurEst);               // BGM 다운로드(네트워크) + 믹스
+  // TTS 켜면 나레이션 segment 합성(Gemini TTS, segment 당 네트워크 왕복)이 추가된다.
+  // 대략 결과물 길이에 비례하는 합성 시간을 보수적으로 더한다.
+  const ttsOverhead = ttsEnabled ? (25 + 1.8 * outDurEst) : 0;
+  const s4 = up(50  + 2.4 * outDurEst + ttsOverhead);  // BGM 다운로드(네트워크) + 믹스 (+ TTS 합성)
 
   const perStage = [s0, s1, s2, s3, s4];
   return {
@@ -55,5 +64,6 @@ export function computeEstimate(refDur: number, srcDur: number, nSources: number
 export async function estimateProject(projectId: string): Promise<Estimate> {
   const ref = await dirDuration(referenceDir(projectId));
   const src = await dirDuration(sourcesDir(projectId));
-  return computeEstimate(ref.total, src.total, src.count);
+  const tts = await readTtsConfig(projectId).catch(() => null);
+  return computeEstimate(ref.total, src.total, src.count, tts?.enabled === true);
 }

@@ -15,13 +15,17 @@ import { serve } from '@hono/node-server';
 
 import {
   ARTIFACTS, bgmDir, ensureDir, fileExists, newProjectId, projectDir,
-  readJson, readStyleNote, referenceDir, sourcesDir, writeStyleNote,
+  readJson, readStyleNote, referenceDir, sourcesDir, writeJson, writeStyleNote,
 } from '../../lib/paths';
+import { ensurePreviewFrames } from '../../lib/preview-frames';
+import { fetchBgmCandidates, downloadBgmTrack, BgmCandidate } from '../../lib/archive';
+import { identifyReferenceBgm } from '../../lib/bgm-identify';
 import { checkStageConfig, StageId } from '../../lib/config';
 import { DEFAULT_BRIEF, readStyleBrief, writeStyleBrief } from '../../lib/style-brief';
 import { generateStyleSuggest, readStyleSuggest } from '../../lib/style-suggest';
 import { DEFAULT_TTS_CONFIG, readTtsConfig, writeTtsConfig } from '../../lib/tts-config';
 import { readTtsOutline, validateOutline } from '../../lib/tts-outline';
+import { DEFAULT_AUDIO_CONFIG, readAudioConfig, writeAudioConfig } from '../../lib/audio-config';
 import { ensureIgFetchAlive, importInstagramUrl } from '../../lib/ig-fetch';
 
 import { createJob, getJob, publicJob, setRunner } from './queue';
@@ -146,6 +150,7 @@ app.get('/api/project', async (c) => {
   const styleBrief = await readStyleBrief(projectId);
   const ttsConfig = await readTtsConfig(projectId);
   const ttsOutline = await readTtsOutline(projectId);
+  const audioConfig = await readAudioConfig(projectId);
 
   return c.json({
     ok: true,
@@ -154,6 +159,7 @@ app.get('/api/project', async (c) => {
     styleBrief,
     ttsConfig,
     ttsOutline,
+    audioConfig,
     ttsOutlineIssues: validateOutline(ttsOutline),
     uploads: { reference, sources, bgm },
     stages,
@@ -234,7 +240,16 @@ app.post('/api/run', async (c) => {
     if (!Number.isInteger(stage) || stage < 0 || stage > 4) return c.json({ error: `stage 가 잘못됨: ${body.stage}` }, 400);
     const cfgErr = checkStageConfig(stage as StageId);
     if (cfgErr) return c.json({ error: cfgErr }, 400);
-    const job = createJob('stage', projectId, { stage });
+    const params: any = { stage };
+    // Stage 0 재분석 옵션 — "다시 분석하기" 가 누른 케이스.
+    // 다른 stage 에서는 무시한다.
+    if (stage === 0) {
+      if (body.reanalyze === true) params.reanalyze = true;
+      if (typeof body.userFocus === 'string' && body.userFocus.trim()) {
+        params.userFocus = body.userFocus.trim().slice(0, 1000);
+      }
+    }
+    const job = createJob('stage', projectId, params);
     return c.json({ ok: true, jobId: job.id });
   }
 
@@ -333,11 +348,147 @@ app.post('/api/style-suggest', async (c) => {
   }
 });
 
+// ============================================================
+// 미리보기 프레임 — UI 진행 화면 캐러셀용
+// 레퍼런스 + 소스에서 골고루 추출한 jpg 들을 반환.
+// ============================================================
+app.get('/api/preview-frames', async (c) => {
+  const projectId = c.req.query('projectId') || '';
+  if (!projectId) return c.json({ error: 'projectId 누락' }, 400);
+  try { await fsp.access(projectDir(projectId)); } catch { return c.json({ error: 'project 가 존재하지 않습니다' }, 404); }
+  const count = Math.max(4, Math.min(24, Number(c.req.query('count')) || 16));
+  try {
+    const frames = await ensurePreviewFrames(projectId, count);
+    return c.json({
+      ok: true,
+      frames: frames.map(f => ({
+        url: '/api/file?path=' + encodeURIComponent(relForServe(f.path)),
+        source: f.source,
+        sourceFile: f.sourceFile,
+      })),
+    });
+  } catch (e: any) {
+    return c.json({ error: e?.message || String(e) }, 500);
+  }
+});
+
+// ============================================================
+// BGM 후보 (다운로드 없이) — 사용자가 듣고 고름.
+// 캐시: 4_final/bgm-candidates.json
+// ============================================================
+app.get('/api/bgm-candidates', async (c) => {
+  const projectId = c.req.query('projectId') || '';
+  if (!projectId) return c.json({ error: 'projectId 누락' }, 400);
+  try { await fsp.access(projectDir(projectId)); } catch { return c.json({ error: 'project 가 존재하지 않습니다' }, 404); }
+
+  const force = c.req.query('force') === '1';
+  const cachePath = path.join(projectDir(projectId), '4_final', 'bgm-candidates.json');
+  if (!force) {
+    const cached = await readJson<any>(cachePath);
+    if (cached && Array.isArray(cached.candidates) && cached.candidates.length > 0) {
+      return c.json({ ok: true, ...cached, cached: true });
+    }
+  }
+
+  const spec = await readJson<any>(ARTIFACTS.editSpec(projectId));
+  if (!spec) return c.json({ error: '레퍼런스 분석 결과가 없습니다 (Stage 0 먼저 실행)' }, 400);
+  const audioProfile = spec.audio_profile || {};
+
+  // 레퍼런스 BGM 식별 (토큰 있을 때만 — 실패해도 무시)
+  let referenceBgm: any = null;
+  try {
+    const dir = referenceDir(projectId);
+    const files = (await fsp.readdir(dir).catch(() => [])).filter(f => !f.startsWith('.'));
+    if (files.length > 0) {
+      const refFile = path.join(dir, files[0]);
+      const r = await identifyReferenceBgm(refFile, path.join(projectDir(projectId), '4_final', 'tmp'));
+      referenceBgm = {
+        status: r.status,
+        title: r.identity?.title,
+        artist: r.identity?.artist,
+        album: r.identity?.album,
+        release_date: r.identity?.release_date,
+        genres: r.identity?.genres,
+        song_link: r.identity?.song_link,
+        spotify_url: r.identity?.spotify_url,
+        apple_url: r.identity?.apple_url,
+      };
+    }
+  } catch { /* 무시 */ }
+
+  try {
+    const candidates: BgmCandidate[] = await fetchBgmCandidates(audioProfile, 6);
+    const payload = { profile: audioProfile, referenceBgm, candidates };
+    await writeJson(cachePath, payload);
+    return c.json({ ok: true, ...payload, cached: false });
+  } catch (e: any) {
+    return c.json({ error: e?.message || String(e) }, 500);
+  }
+});
+
+// ============================================================
+// BGM 선택 — 고른 트랙을 다운로드해서 bgm/ 디렉토리에 저장
+// 이후 Stage 4 실행 시 uploaded BGM 으로 사용됨.
+// body: { projectId, identifier, source_url, title }
+// none 모드: { projectId, none: true } → bgm/ 비우고 사용 안 함
+// ============================================================
+app.post('/api/bgm-pick', async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json({ error: 'JSON 파싱 실패' }, 400);
+  const projectId = String(body.projectId || '').trim();
+  if (!projectId) return c.json({ error: 'projectId 누락' }, 400);
+  try { await fsp.access(projectDir(projectId)); } catch { return c.json({ error: 'project 가 존재하지 않습니다' }, 404); }
+
+  const dir = bgmDir(projectId);
+  await ensureDir(dir);
+  // bgm/ 비우기 (이전 선택 청소)
+  for (const f of await fsp.readdir(dir).catch(() => [])) {
+    await fsp.rm(path.join(dir, f), { force: true });
+  }
+
+  if (body.none === true) {
+    return c.json({ ok: true, mode: 'none' });
+  }
+
+  const sourceUrl = String(body.source_url || '').trim();
+  const identifier = String(body.identifier || '').trim();
+  if (!sourceUrl) return c.json({ error: 'source_url 누락' }, 400);
+
+  const safeName = `archive_${identifier.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40)}.mp3`;
+  const destPath = path.join(dir, safeName);
+  try {
+    await downloadBgmTrack(sourceUrl, destPath);
+    return c.json({ ok: true, mode: 'picked', filename: safeName, title: body.title || null });
+  } catch (e: any) {
+    return c.json({ error: '다운로드 실패: ' + (e?.message || String(e)) }, 502);
+  }
+});
+
 app.post('/api/tts-config', async (c) => {
   const { projectId, tts } = await c.req.json().catch(() => ({}));
   if (!projectId) return c.json({ error: 'projectId 누락' }, 400);
+  try { await fsp.access(projectDir(projectId)); } catch { return c.json({ error: 'project 가 존재하지 않습니다' }, 404); }
   await writeTtsConfig(projectId, { ...DEFAULT_TTS_CONFIG, ...(tts || {}) });
   return c.json({ ok: true });
+});
+
+// ---- 오디오 밸런스 설정 (원본 음량) ----
+app.post('/api/audio-config', async (c) => {
+  const { projectId, audio } = await c.req.json().catch(() => ({}));
+  if (!projectId) return c.json({ error: 'projectId 누락' }, 400);
+  try { await fsp.access(projectDir(projectId)); } catch { return c.json({ error: 'project 가 존재하지 않습니다' }, 404); }
+  await writeAudioConfig(projectId, { ...DEFAULT_AUDIO_CONFIG, ...(audio || {}) });
+  return c.json({ ok: true });
+});
+
+// ---- 레퍼런스 분석 결과 (edit-spec.json) — 디버그/표시용 ----
+// 전체 spec 을 그대로 반환. 없으면 spec:null.
+app.get('/api/edit-spec', async (c) => {
+  const projectId = c.req.query('projectId') || '';
+  if (!projectId) return c.json({ error: 'projectId 누락' }, 400);
+  try { await fsp.access(projectDir(projectId)); } catch { return c.json({ error: 'project 가 존재하지 않습니다' }, 404); }
+  const spec = await readJson<any>(ARTIFACTS.editSpec(projectId));
+  return c.json({ ok: true, spec: spec ?? null });
 });
 
 // ============================================================

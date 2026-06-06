@@ -1,16 +1,19 @@
 // ============================================================
-// 나레이션 개요 (TTS 합성 전 사용자 confirm 단계).
+// 나레이션 개요 (TTS segments) 저장소.
 //
-// 흐름:
-//   1) Stage 1 끝난 후 /api/tts-outline POST  →  Gemini Flash 가 edit-plan 기반으로
-//      segments 자동 생성 (approved=false).
-//   2) 사용자가 UI 에서 segments 편집/제거.
-//   3) PATCH { approved: true } 로 확정.
-//   4) Stage 4 가 approved=true 인 segments 만 TTS 합성·배치.
+// 현재 흐름 (lib/narration.ts 의 prepareNarrationOutline 이 단일 소스):
+//   Stage 4 직전, TtsConfig(source/genMode) 에 따라 segments 를 생성하고
+//   approved=true 로 바로 기록한다 — 옵션 선택이 곧 승인이라 별도 confirm
+//   단계(POST/PATCH/UI)나 Gemini 자동 생성 단계는 없다.
+//     · source='captions'        → edit-plan 의 화면 자막을 그대로
+//     · source='generate' auto    → OpenAI(chatJson) 로 작성
+//     · source='generate' manual  → 사용자 대본을 컷에 분배
+//   Stage 4 는 이 segments 를 합성·배치한다.
 //
 // segment 의 [output_start, output_end] 는 최종 영상 타임라인 기준.
-// 인접 segment 끼리 시간이 겹치면 안 되며, 한 segment 의 text 길이는
-// (output_end - output_start) * 5.5 자 이하 권장 (한국어 발화 속도).
+// 인접 segment 끼리 시간이 겹치면 안 되며 (narration.ts 가 클램프),
+// 한 segment 의 text 길이는 (output_end - output_start) * 5자 이하 권장.
+// validateOutline() 은 현재 정보성 표시(ttsOutlineIssues)로만 쓰인다.
 // ============================================================
 
 import fs from 'fs/promises';
@@ -25,7 +28,7 @@ export type NarrationSegment = {
 
 export type TtsOutline = {
   generated_at: string | null;
-  generated_model: string;       // 어떤 Gemini 모델로 만들었는지
+  generated_model: string;       // 'captions' | 'manual' | OpenAI 모델명 | 'failed'
   total_duration: number;        // 영상 길이(초)
   segments: NarrationSegment[];
   approved: boolean;

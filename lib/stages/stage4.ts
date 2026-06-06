@@ -4,13 +4,17 @@
 // 출력: 4_final/final.mp4
 //
 // 오디오 정책:
-// 1. plan items 의 source_has_speech == false 인 시간 구간은 원본 영상 오디오를 0 으로 mute.
-//    → 발화 없는 컷의 원본 잡음(바람·기계음·배경 소음 등) 자동 제거.
-// 2. BGM 은 평소 0.65 (이전 0.30 보다 크게). 발화 구간에선 sidechain ducking 으로 자동 압축.
-// 3. 최종 loudnorm 은 I=-14 LUFS (SNS/유튜브 표준에 가까움, 이전 -16 보다 살짝 크게).
+// 1. 원본 영상 소리(현장음)는 audio-config.json 의 originalVolume 으로 제어:
+//      'mute'(기본) → 원본 빼고 음원(BGM)만   /  'low','full' → 원본 살리고 BGM 은 그 아래로 ducking.
+//    원본을 살릴 때 source_has_speech==false 구간은 잡음으로 보고 추가로 mute.
+// 2. BGM 볼륨은 모드별로 다름 (constants 참고): BGM only(원본 mute)=1.0, 원본 살림=0.55, TTS 메인=0.13.
+//    발화/나레이션 구간에선 sidechain ducking 으로 자동 압축.
+// 3. TTS(나레이션)가 켜지면 원본은 항상 mute 되고 TTS 가 메인 음성. (lib/narration.ts 가 segments 생성)
+// 4. 최종 loudnorm 은 I=-14 LUFS (SNS/유튜브 표준에 가까움).
 //
-// BGM 결정 우선순위는 기존과 동일:
-//   업로드된 BGM > Internet Archive 자동 다운로드 > 없으면 voice_only.
+// BGM 결정 우선순위:
+//   업로드된 BGM > Internet Archive 자동 다운로드 > 없음.
+// 최종 mode: voice_only | bgm_mixed | bgm_only | tts_only | tts_bgm_mixed.
 // ============================================================
 
 import fs from 'fs/promises';
@@ -19,13 +23,17 @@ import { ARTIFACTS, appendRawResponse, bgmDir, ensureDir, readJson, referenceDir
 import { probeDuration, runFfmpeg } from '../ffmpeg';
 import { fetchBgmFromArchive } from '../archive';
 import { archiveHintsFromIdentity, BgmIdentifyResult, identifyReferenceBgm } from '../bgm-identify';
-import { readTtsConfig } from '../tts-config';
-import { readTtsOutline, validateOutline, writeTtsOutline } from '../tts-outline';
+import { readTtsConfig, TtsConfig } from '../tts-config';
+import { NarrationSegment, writeTtsOutline } from '../tts-outline';
+import { prepareNarrationOutline } from '../narration';
+import { readAudioConfig, ORIGINAL_VOLUME_GAIN } from '../audio-config';
+import { config } from '../config';
 import { DEFAULT_VOICE, synthesizeTtsToWav } from '../tts';
 
 // BGM 볼륨: TTS 가 있을 때는 BGM 을 매우 작게 깔아서 TTS 우선 보장.
 // 추가로 sidechain ducking 이 발화 중에 더 줄여줌 (release 180ms 로 빠르게 복귀).
-const BGM_VOLUME_NO_TTS = 0.55;           // 원본 voice 또는 voice 없는 모드
+const BGM_VOLUME_NO_TTS = 0.55;           // 원본 voice 를 살리고 BGM 을 그 아래로 깔 때 (ducking 별도)
+const BGM_VOLUME_SOLO = 1.0;              // BGM only (원본 mute) — BGM 이 유일 음원이라 크게. loudnorm 이 최종 평준화.
 const BGM_VOLUME_WITH_TTS = 0.13;         // TTS 가 메인 음성일 때 BGM 깔개 (sidechain ducking 별도)
 const TTS_VOLUME_BOOST = 1.30;            // TTS 자체 볼륨 부스트 (loudnorm 전, BGM 대비 명확히)
 // 각 TTS segment 의 음량 일정화 — Gemini TTS preview 가 segment 마다 음량이 들쭉날쭉이라
@@ -47,7 +55,7 @@ type TtsLayer = { start: number; path: string; duration: number; atempo: number;
 
 export async function runStage4(projectId: string): Promise<{
   ok: true;
-  mode: 'voice_only' | 'bgm_mixed' | 'tts_only' | 'tts_bgm_mixed';
+  mode: 'voice_only' | 'bgm_mixed' | 'bgm_only' | 'tts_only' | 'tts_bgm_mixed';
   bgm?: { source: 'uploaded' | 'archive'; title?: string; identifier?: string; query_used?: string };
   reference_bgm?: {
     status: 'no_token' | 'no_match' | 'matched' | 'error';
@@ -139,90 +147,42 @@ export async function runStage4(projectId: string): Promise<{
     }
   }
 
-  // ---- TTS 합성 (outline 기반, approved=true 일 때만) ----
-  // 핵심 정책 변경:
-  //   - 더 이상 cut 별로 자동 합성하지 않는다 → overlay 의 근본 원인.
-  //   - 사용자가 /api/tts-outline POST 로 개요 생성 → 편집 → PATCH approved=true 로 확정한 segments 만 사용.
-  //   - 각 segment 합성 후 실측 길이가 slot 보다 길면 atempo 로 자동 압축 (최대 2배).
-  //   - segments 는 시간순 정렬 + 비겹침 보장 (outline.ts 의 normalize/validate).
+  // ---- 오디오 밸런스 + TTS 설정 ----
+  const audioConfig = await readAudioConfig(projectId);
   const ttsConfig = await readTtsConfig(projectId);
-  const ttsOutline = await readTtsOutline(projectId);
-  const ttsLayers: TtsLayer[] = [];
+  const videoDur = await probeDuration(captioned);
 
+  // ---- TTS 나레이션 준비 + 합성 ----
+  // 옵션(source/genMode)에 따라 segments 를 만들고 각 segment 를 WAV 로 합성.
+  // 합성은 Gemini 키가 필요 → 없으면 TTS 를 막지 말고 조용히 건너뛴다.
+  let ttsLayers: TtsLayer[] = [];
   if (ttsConfig.enabled) {
-    if (!ttsOutline.approved) {
-      throw new Error('TTS 가 활성화돼 있지만 나레이션 개요가 확정(approved) 되지 않았습니다. UI 에서 개요를 생성·검토하고 "확인하고 진행" 을 누르세요.');
+    if (!config.GEMINI_API_KEY) {
+      await appendRawResponse(projectId, { stage: 4, kind: 'tts_skipped_no_key' });
+    } else {
+      ttsLayers = await synthesizeNarrationLayers(projectId, ttsConfig, videoDur);
     }
-    if (ttsOutline.segments.length === 0) {
-      throw new Error('TTS 가 활성화돼 있지만 나레이션 개요에 segment 가 없습니다. 개요를 다시 생성하세요.');
-    }
-    const issues = validateOutline(ttsOutline);
-    if (issues.some(m => m.includes('겹칩니다'))) {
-      throw new Error(`나레이션 개요에 시간 겹침이 있습니다:\n${issues.join('\n')}\n개요를 수정하고 다시 확정하세요.`);
-    }
-
-    const voice = ttsConfig.voice || DEFAULT_VOICE;
-    const dir = ARTIFACTS.ttsAudioDir(projectId);
-    await ensureDir(dir);
-    for (const f of (await fs.readdir(dir).catch(() => []))) {
-      await fs.rm(path.join(dir, f), { force: true });
-    }
-
-    const correctionNotes: string[] = [];
-    for (let i = 0; i < ttsOutline.segments.length; i++) {
-      const seg = ttsOutline.segments[i];
-      const outPath = path.join(dir, `seg_${String(i).padStart(4, '0')}.wav`);
-      const slotDur = Math.max(0.05, seg.output_end - seg.output_start);
-      try {
-        const r = await synthesizeTtsToWav(seg.text, outPath, { voice });
-        // slot 보다 길면 atempo 로 압축 (자연스러움 유지를 위해 최대 1.6 권장, 안전 상한 2.0).
-        let atempo = 1.0;
-        if (r.durationSec > slotDur * 1.02) {
-          atempo = Math.min(2.0, r.durationSec / slotDur);
-          correctionNotes.push(
-            `segment #${i} (cut=${seg.cut_index}): tts=${r.durationSec.toFixed(2)}s > slot=${slotDur.toFixed(2)}s → atempo=${atempo.toFixed(2)}`
-          );
-        }
-        ttsLayers.push({
-          start: seg.output_start,
-          path: outPath,
-          duration: r.durationSec,
-          atempo,
-          slotDuration: slotDur,
-        });
-        await appendRawResponse(projectId, {
-          stage: 4, kind: 'tts_segment',
-          segment_index: i, cut_index: seg.cut_index,
-          voice, text_chars: seg.text.length,
-          tts_duration_sec: r.durationSec, slot_duration_sec: slotDur, atempo,
-        });
-      } catch (e: any) {
-        await appendRawResponse(projectId, {
-          stage: 4, kind: 'tts_segment_failed',
-          segment_index: i, error: e?.message || String(e),
-        });
-      }
-    }
-
-    // 합성 결과를 outline 에 기록 (다음 confirm 때 사용자가 확인할 수 있게)
-    await writeTtsOutline(projectId, {
-      ...ttsOutline,
-      last_synthesis: { at: new Date().toISOString(), notes: correctionNotes },
-    });
   }
 
+  // ---- 오디오 밸런스 결정 ----
+  // origVol: 원본 영상 소리 게인 (mute=0 / low / full). loudnorm 이 마지막에 평준화.
   const hasTts = ttsLayers.length > 0;
   const hasBgm = bgms.length > 0;
+  let origVol = ORIGINAL_VOLUME_GAIN[audioConfig.originalVolume];
+  // 안전장치: TTS 도 BGM 도 없는데 원본까지 mute 면 무음 영상이 된다 → 원본을 살린다.
+  const fallbackForcedAudible = !hasTts && !hasBgm && origVol === 0;
+  if (fallbackForcedAudible) origVol = ORIGINAL_VOLUME_GAIN.full;
+  // TTS 가 메인 음성일 때 원본은 항상 mute (origVol 무시).
+  const originalAudible = !hasTts && origVol > 0;
 
   await appendRawResponse(projectId, {
     stage: 4, kind: 'audio_plan',
     noise_muted_ranges: noiseRanges.length, ranges: noiseRanges,
-    bgm_source: hasBgm ? bgmSource : 'none', bgm_volume: hasTts ? BGM_VOLUME_WITH_TTS : BGM_VOLUME_NO_TTS,
-    tts_enabled: ttsConfig.enabled, tts_mode: ttsConfig.mode,
+    bgm_source: hasBgm ? bgmSource : 'none',
+    original_volume: audioConfig.originalVolume, original_audible: originalAudible,
+    tts_enabled: ttsConfig.enabled, tts_source: ttsConfig.source, tts_gen_mode: ttsConfig.genMode,
     tts_layers: ttsLayers.length,
   });
-
-  const videoDur = await probeDuration(captioned);
 
   // ---- 입력 순서 결정: [0]=captioned, ([1]=bgm), ([n..]=tts) ----
   const ffInputs: string[] = [captioned];
@@ -250,13 +210,22 @@ export async function runStage4(projectId: string): Promise<{
   // ---- filter_complex 구성 ----
   const parts: string[] = [];
 
-  // 1) voice 처리: TTS 있으면 완전 mute, 없으면 노이즈 구간만 mute
+  // 1) 원본 영상 오디오 처리 ([srcA])
+  //    - TTS 메인 음성 → 원본 mute (volume=0) 후 mix 에 합류 (silent input)
+  //    - 원본 살림(originalAudible) → 노이즈 구간 추가 mute + origVol 스케일
+  //    - BGM only (원본 mute, TTS 없음) → [srcA] 자체를 만들지 않는다
+  //      (만들어두면 어떤 출력에도 연결되지 않아 ffmpeg 가 에러를 낸다)
   if (hasTts) {
     parts.push(`[0:a]volume=0[srcA]`);
-  } else if (noiseEnableExpr) {
-    parts.push(`[0:a]volume=0:enable='${noiseEnableExpr}'[srcA]`);
-  } else {
-    parts.push(`[0:a]anull[srcA]`);
+  } else if (originalAudible) {
+    // 노이즈 구간 mute 는 "다른 음원(BGM 등)이 있을 때" 발화 없는 컷의 잡음을 죽이는 용도.
+    // 안전장치로 원본이 유일 음원이 된 경우엔, 모든 컷이 noise 로 판정되면 전체가 0 이 되어
+    // 무음 영상이 되므로 noise-mute 를 적용하지 않고 원본을 그대로 살린다.
+    if (noiseEnableExpr && !fallbackForcedAudible) {
+      parts.push(`[0:a]volume=0:enable='${noiseEnableExpr}',volume=${origVol.toFixed(2)}[srcA]`);
+    } else {
+      parts.push(`[0:a]volume=${origVol.toFixed(2)}[srcA]`);
+    }
   }
 
   // 2) TTS layer 들 → atempo 보정 + dynaudnorm (segment 음량 일정화) + volume 부스트 + adelay 배치 → ttsLabel 하나로 모음.
@@ -285,10 +254,14 @@ export async function runStage4(projectId: string): Promise<{
     }
   }
 
-  // 3) BGM 처리 + sidechain ducking
-  //    TTS 모드에서는 BGM 자체 볼륨을 더 작게 깔고, sidechain 도 더 공격적으로 작동.
+  // 3) BGM 처리 + (선택) sidechain ducking
+  //    - TTS 모드: TTS 가 trigger, BGM 작게 깔개.
+  //    - 원본 살림 모드: 원본 발화가 trigger, BGM 중간 → 발화 중 dip.
+  //    - BGM only 모드: 원본이 mute 라 duck 대상이 없음 → BGM 단독, 크게.
   if (hasBgm && bgmInputIdx !== null) {
-    const bgmVol = hasTts ? BGM_VOLUME_WITH_TTS : BGM_VOLUME_NO_TTS;
+    const bgmVol = hasTts ? BGM_VOLUME_WITH_TTS
+      : originalAudible ? BGM_VOLUME_NO_TTS
+        : BGM_VOLUME_SOLO;
     parts.push(
       `[${bgmInputIdx}:a]atrim=start=${bgmStart.toFixed(3)},asetpts=PTS-STARTPTS,` +
       `aloop=loop=-1:size=2e9,atrim=duration=${videoDur.toFixed(3)},volume=${bgmVol.toFixed(2)}[bgm0]`
@@ -298,25 +271,31 @@ export async function runStage4(projectId: string): Promise<{
       // release 180ms 로 발화 끝나면 빠르게 복귀해서 BGM 이 끊김 없이 흐름.
       parts.push(`${ttsLabel}asplit=2[ttsMix][ttsTrig]`);
       parts.push(`[bgm0][ttsTrig]sidechaincompress=threshold=0.03:ratio=15:attack=4:release=180[bgmDuck]`);
-    } else {
-      // 원본 voice 가 trigger (기존 동작)
+    } else if (originalAudible) {
+      // 원본 voice 가 trigger (BGM 이 원본 위에 깔리고 발화 중 dip)
       parts.push(`[srcA]asplit=2[srcMix][srcTrig]`);
       parts.push(`[bgm0][srcTrig]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=300[bgmDuck]`);
     }
+    // else: BGM only → [bgm0] 를 그대로 최종 mix 로.
   }
 
   // 4) 최종 mix
-  let mode: 'voice_only' | 'bgm_mixed' | 'tts_only' | 'tts_bgm_mixed';
+  let mode: 'voice_only' | 'bgm_mixed' | 'bgm_only' | 'tts_only' | 'tts_bgm_mixed';
   if (hasTts && hasBgm) {
     parts.push(`[srcA][ttsMix][bgmDuck]amix=inputs=3:duration=first:dropout_transition=0,${LOUDNORM}[aout]`);
     mode = 'tts_bgm_mixed';
   } else if (hasTts) {
     parts.push(`[srcA]${ttsLabel}amix=inputs=2:duration=first:dropout_transition=0,${LOUDNORM}[aout]`);
     mode = 'tts_only';
-  } else if (hasBgm) {
+  } else if (hasBgm && originalAudible) {
     parts.push(`[srcMix][bgmDuck]amix=inputs=2:duration=first:dropout_transition=0,${LOUDNORM}[aout]`);
     mode = 'bgm_mixed';
+  } else if (hasBgm) {
+    // BGM only — 원본 mute, ducking 없음. BGM 단독으로 loudnorm.
+    parts.push(`[bgm0]${LOUDNORM}[aout]`);
+    mode = 'bgm_only';
   } else {
+    // 원본 only (BGM 없음). originalAudible 이므로 [srcA] 존재.
     parts.push(`[srcA]${LOUDNORM}[aout]`);
     mode = 'voice_only';
   }
@@ -358,6 +337,96 @@ export async function runStage4(projectId: string): Promise<{
     } : undefined,
     noise_muted_ranges: noiseRanges.length,
   };
+}
+
+// ============================================================
+// 나레이션 개요 준비 + segment 별 TTS 합성 → TtsLayer[] 반환.
+// runStage4 에서 분리해 오디오 믹스 로직과 합성 로직을 떼어놓는다.
+// 실패해도 [] 를 반환 → 영상 전체를 죽이지 않고 TTS 없이 진행.
+// ============================================================
+async function synthesizeNarrationLayers(
+  projectId: string,
+  ttsConfig: TtsConfig,
+  videoDur: number,
+): Promise<TtsLayer[]> {
+  // 자동 생성은 OpenAI 로 나레이션을 쓴다 → 키 없으면 명시적으로 스킵 (silent fail 방지).
+  if (ttsConfig.source === 'generate' && ttsConfig.genMode === 'auto' && !config.OPENAI_API_KEY) {
+    await appendRawResponse(projectId, { stage: 4, kind: 'tts_skipped_no_openai_key' });
+    return [];
+  }
+
+  // 나레이션 개요 준비. LLM(자동) 실패 등으로 throw 해도 TTS 없이 진행하되,
+  // 직전 성공 run 의 outline 이 남아 표시되지 않도록 빈 outline 으로 덮어쓴다.
+  let segments: NarrationSegment[] = [];
+  try {
+    const prep = await prepareNarrationOutline(projectId, ttsConfig, videoDur);
+    segments = prep.segments;
+    await appendRawResponse(projectId, {
+      stage: 4, kind: 'tts_outline_prepared',
+      source: ttsConfig.source, gen_mode: ttsConfig.genMode,
+      generated_model: prep.generatedModel, segments: segments.length,
+    });
+  } catch (e: any) {
+    await appendRawResponse(projectId, {
+      stage: 4, kind: 'tts_outline_failed',
+      source: ttsConfig.source, gen_mode: ttsConfig.genMode,
+      error: e?.message || String(e),
+    });
+    await writeTtsOutline(projectId, {
+      generated_at: new Date().toISOString(),
+      generated_model: 'failed', total_duration: videoDur,
+      segments: [], approved: true, approved_at: new Date().toISOString(),
+      last_synthesis: null,
+    });
+    return [];
+  }
+
+  if (segments.length === 0) return [];
+
+  const voice = ttsConfig.voice || DEFAULT_VOICE;
+  const dir = ARTIFACTS.ttsAudioDir(projectId);
+  await ensureDir(dir);
+  for (const f of (await fs.readdir(dir).catch(() => []))) {
+    await fs.rm(path.join(dir, f), { force: true });
+  }
+
+  const layers: TtsLayer[] = [];
+  const correctionNotes: string[] = [];
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const outPath = path.join(dir, `seg_${String(i).padStart(4, '0')}.wav`);
+    const slotDur = Math.max(0.05, seg.output_end - seg.output_start);
+    try {
+      const r = await synthesizeTtsToWav(seg.text, outPath, { voice });
+      // slot 보다 길면 atempo 로 압축 (안전 상한 2.0).
+      let atempo = 1.0;
+      if (r.durationSec > slotDur * 1.02) {
+        atempo = Math.min(2.0, r.durationSec / slotDur);
+        correctionNotes.push(
+          `segment #${i} (cut=${seg.cut_index}): tts=${r.durationSec.toFixed(2)}s > slot=${slotDur.toFixed(2)}s → atempo=${atempo.toFixed(2)}`
+        );
+      }
+      layers.push({ start: seg.output_start, path: outPath, duration: r.durationSec, atempo, slotDuration: slotDur });
+      await appendRawResponse(projectId, {
+        stage: 4, kind: 'tts_segment',
+        segment_index: i, cut_index: seg.cut_index,
+        voice, text_chars: seg.text.length,
+        tts_duration_sec: r.durationSec, slot_duration_sec: slotDur, atempo,
+      });
+    } catch (e: any) {
+      await appendRawResponse(projectId, {
+        stage: 4, kind: 'tts_segment_failed',
+        segment_index: i, error: e?.message || String(e),
+      });
+    }
+  }
+
+  // 합성 보정 기록 (디버깅용)
+  await writeTtsOutline(projectId, {
+    last_synthesis: { at: new Date().toISOString(), notes: correctionNotes },
+  });
+
+  return layers;
 }
 
 async function pickBgmStartOffset(filePath: string, videoDur: number, profile: AudioProfile): Promise<number> {
