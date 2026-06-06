@@ -107,9 +107,32 @@ type EditPlanItem = {
   subject_center_x: number;
   subject_center_y: number;
 
+  // punch-in 줌 배수 (1.0 = 줌 없음). ref shot_type 의 프레이밍 강도를 모방.
+  // 영상 렌더 시 9:16 crop 후 가운데(=주체)로 추가 확대.
+  zoom: number;
+
   // ▼ caption planning 결과 — Stage 3 가 이걸로 렌더링
   planned_caption_layers: CaptionLayer[];
 };
+
+// ref shot_type → punch-in 줌 배수. 클로즈업/제품처럼 타이트한 프레이밍이면 더 확대.
+// 화질 손실 방지를 위해 최대 1.3 으로 제한.
+function zoomForShotType(shotType?: string): number {
+  switch (String(shotType || '').toLowerCase()) {
+    case 'close_up': return 1.30;
+    case 'product': return 1.25;
+    case 'selfie': return 1.15;
+    case 'medium': return 1.12;
+    default: return 1.0;   // wide / pov / b_roll / text_only / 미상
+  }
+}
+
+// 줌 배수 안전 클램프 — 화질 손실 방지를 위해 1.0~1.3.
+function clampZoom(z: any): number {
+  const n = Number(z);
+  if (!Number.isFinite(n)) return 1.0;
+  return Math.max(1.0, Math.min(1.3, n));
+}
 
 export async function runStage1(projectId: string): Promise<{
   ok: true;
@@ -252,6 +275,8 @@ export async function runStage1(projectId: string): Promise<{
 
       subject_center_x: round3(e.s.subject_center_x),
       subject_center_y: round3(e.s.subject_center_y),
+
+      zoom: zoomForShotType(ref.shot_type),
 
       planned_caption_layers: [], // caption planning 단계에서 채움
     });
@@ -1034,11 +1059,23 @@ async function renderCut(
 
     // 영상도 동일하게 oversize 후 crop. force_original_aspect_ratio=increase 의
     // 1px 변환 오차로 가장자리 검은 라인이 보이는 케이스 방지.
-    const vf = [
+    const vfParts = [
       `scale=${OUT_W + 8}:${OUT_H + 8}:force_original_aspect_ratio=increase`,
       `crop=${OUT_W}:${OUT_H}:x='${cropX}':y='${cropY}'`,
-      'setsar=1',
-    ].join(',');
+    ];
+    // punch-in 줌 — 9:16 crop(주체가 가운데로 옴) 후, zoom>1 이면 가운데를 더 확대.
+    // (ref shot_type 기반. 정적 확대라 안정적이고 "특정 부분을 zoom"하는 효과)
+    const zoom = clampZoom(it.zoom);
+    if (zoom > 1.001) {
+      const cw = Math.round(OUT_W / zoom);
+      const ch = Math.round(OUT_H / zoom);
+      const zx = Math.round((OUT_W - cw) / 2);
+      const zy = Math.round((OUT_H - ch) / 2);
+      vfParts.push(`crop=${cw}:${ch}:${zx}:${zy}`);
+      vfParts.push(`scale=${OUT_W}:${OUT_H}`);
+    }
+    vfParts.push('setsar=1');
+    const vf = vfParts.join(',');
 
     await runFfmpeg([
       '-y',

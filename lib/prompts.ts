@@ -139,7 +139,10 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
           "position": "top" | "center" | "bottom",
           "horizontal_align": "left" | "center" | "right",
           "size_level": "small" | "medium" | "large" | "huge",
-          "color_hex": string,                   // "#RRGGBB" — 본문 글자 색
+          "color_hex": string,                   // "#RRGGBB" — 본문(또는 첫 부분) 글자 색
+          "color_runs": [                        // 한 자막 안에서 색이 중간에 바뀌면 부분별로 끊어서. 색이 일정하면 []. runs.text 를 이으면 위 text 와 정확히 같아야 함.
+            { "text": string, "color_hex": string }
+          ],
           "emphasis": "regular" | "bold" | "black",
           "italic": boolean,                     // 글자가 기울어져 있으면 true. 굵기와 직교한다.
           "font_category": "sans" | "serif" | "handwritten" | "condensed" | "rounded" | "display",
@@ -419,6 +422,9 @@ shot_index 는 영상의 시각적 컷 순서로 0 부터 매기고, shot_start 
           "horizontal_align": "left" | "center" | "right",
           "size_level": "small" | "medium" | "large" | "huge",
           "color_hex": string,
+          "color_runs": [                        // 글자 중간에 색이 바뀌면 부분별로 끊어서. 색 일정하면 []. runs.text 이으면 text 와 동일.
+            { "text": string, "color_hex": string }
+          ],
           "emphasis": "regular" | "bold" | "black",
           "italic": boolean,
           "font_category": "sans" | "serif" | "handwritten" | "condensed" | "rounded" | "display",
@@ -651,6 +657,7 @@ ${cutLines}
      · gradient (type / angle / stops 전체. stops 의 color 까지 정확히 같게)
      · has_glow, glow_color_hex, glow_radius
      · letter_spacing, entry_animation
+     · color_runs (글자 중간에 색이 바뀌는 패턴 — ref 에 있으면 같은 구조로, text 만 우리 카피에 맞춰 바꿔라)
    - **임의로 디자인 값 만들어내지 마라.** ref 와 시각적으로 다르면 매칭의 의미가 사라진다.
    - matched_ref_layers 가 비어있는 컷에서 자막을 새로 만들 때는 caption_global_style 의 has_outline / outline_color_hex / has_shadow / has_background_box / primary_color_hex 등을 따라가라.
    - 사용자 styleNote 가 명시적으로 "박스 배경 빼라" 같은 지시를 했을 때만 변형.
@@ -671,6 +678,9 @@ JSON 만 출력. 다른 텍스트 금지.
           "horizontal_align": "left" | "center" | "right",
           "size_level": "small" | "medium" | "large" | "huge",
           "color_hex": string,
+          "color_runs": [                        // 글자 중간에 색이 바뀌면 부분별로 끊어서. 색 일정하면 []. runs.text 이으면 text 와 동일.
+            { "text": string, "color_hex": string }
+          ],
           "emphasis": "regular" | "bold" | "black",
           "italic": boolean,
           "font_category": "sans" | "serif" | "handwritten" | "condensed" | "rounded" | "display",

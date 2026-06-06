@@ -84,7 +84,8 @@ export async function runStage3(projectId: string): Promise<{
     const start = Number(it.output_start);
     const end = Number(it.output_end);
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
-    cuts.push({ start, end, layers });
+    const sy = Number(it.subject_center_y);
+    cuts.push({ start, end, layers, subjectCenterY: Number.isFinite(sy) ? sy : undefined });
   }
 
   const ass = buildCaptionAss(cuts, globalStyle);
