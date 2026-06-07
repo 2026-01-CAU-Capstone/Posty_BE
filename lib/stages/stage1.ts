@@ -772,9 +772,73 @@ function applyCaptionPlanFromParsed(plan: EditPlanItem[], parsed: any, captionMo
       continue;
     }
     // layers: [] 는 "이 컷에는 자막 없음"이라는 정상 응답이므로 그대로 보존한다.
-    plan[i].planned_caption_layers = normalizeLayers(c.layers);
+    // LLM 이 만든 "형태"(레이어 개수·텍스트·크기·폰트)는 그대로 두고, 충실도가 낮은
+    // "색/위치" 값만 매칭된 ref layer 에서 결정적으로 재주입한다.
+    plan[i].planned_caption_layers = reinjectRefStyle(normalizeLayers(c.layers), plan[i].ref_caption_layers);
   }
   enforceCaptionMode(plan, captionMode, captionDensity);
+}
+
+// ============================================================
+// ref → planned 색/위치 결정적 재주입.
+//
+// 배경: caption planning(LLM) 이 ref 의 색(특히 박스·외곽선·그라데이션)과 세로/가로
+// 위치를 자주 흘려, 결과가 흰 글씨·바닥 중앙으로 표류한다. (preserveLayerDesign 이
+// color_hex/position/horizontal_align 을 보존 대상에서 제외 → 충실도가 전적으로 LLM
+// 출력에 의존하고, 한 번 뭉개지면 복구 경로가 없다.)
+//
+// 정책: planned 와 ref 를 "레이어 인덱스"로 매칭해, ref 에 값이 있는 "색·위치" 필드만
+// planned 에 덮어쓴다. text / size_level / emphasis / font / 레이어 개수는 절대 건드리지
+// 않아 자막 "형태"는 그대로 유지된다. ref[k] 가 없으면 손대지 않아 렌더 단계 sanitizeLayer
+// 가 caption_global_style 로 폴백할 여지를 남긴다.
+// ============================================================
+export function reinjectRefStyle(planned: CaptionLayer[], ref?: CaptionLayer[]): CaptionLayer[] {
+  if (!Array.isArray(planned) || planned.length === 0) return planned;
+  if (!Array.isArray(ref) || ref.length === 0) return planned;
+
+  const str = (v: any): string | undefined => (typeof v === 'string' && v.trim() ? v : undefined);
+
+  return planned.map((p, k) => {
+    const r = ref[k];
+    if (!r || typeof r !== 'object') return p; // 매칭 ref layer 없음 → LLM 값 유지(이후 global 폴백)
+    const out: CaptionLayer = { ...p };
+
+    // ── 색 (형태 무관) ──
+    const colorHex = str(r.color_hex);
+    if (colorHex) out.color_hex = colorHex;
+    if (typeof r.has_background_box === 'boolean') out.has_background_box = r.has_background_box;
+    const boxColor = str(r.background_color_hex);
+    if (boxColor) out.background_color_hex = boxColor;
+    if (Number.isFinite(r.background_padding as number)) out.background_padding = r.background_padding;
+    const outlineColor = str(r.outline_color_hex);
+    if (outlineColor) out.outline_color_hex = outlineColor;
+    const outlineThickness = str(r.outline_thickness);
+    if (outlineThickness) out.outline_thickness = outlineThickness;
+    if (typeof r.has_shadow === 'boolean') out.has_shadow = r.has_shadow;
+    const shadowColor = str(r.shadow_color_hex);
+    if (shadowColor) out.shadow_color_hex = shadowColor;
+    if (typeof r.has_glow === 'boolean') out.has_glow = r.has_glow;
+    const glowColor = str(r.glow_color_hex);
+    if (glowColor) out.glow_color_hex = glowColor;
+    if (r.gradient && typeof r.gradient === 'object') out.gradient = r.gradient;
+    // color_runs(글자 중간 색변경)는 ref 에 있고 LLM 이 자체 runs 를 만들지 않았을 때만
+    // ref 색 시퀀스를 빌려온다 (렌더러가 grapheme 순서로 매핑하므로 텍스트가 달라도 색만 따라감).
+    if ((!Array.isArray(p.color_runs) || p.color_runs.length < 2)
+        && Array.isArray(r.color_runs) && r.color_runs.length >= 2) {
+      out.color_runs = r.color_runs;
+    }
+
+    // ── 위치 (형태 무관: 레이어 개수·텍스트 불변) ──
+    const position = str(r.position);
+    if (position) out.position = position;
+    const hAlign = str(r.horizontal_align);
+    if (hAlign) out.horizontal_align = hAlign;
+    // 좌표 기반 위치 — ref 의 정밀 세로/가로 위치를 그대로 복원 (가로가 center 로 뭉개지지 않게).
+    if (Number.isFinite(r.vertical_ratio as number)) out.vertical_ratio = r.vertical_ratio;
+    if (Number.isFinite(r.horizontal_ratio as number)) out.horizontal_ratio = r.horizontal_ratio;
+
+    return out;
+  });
 }
 
 function enforceCaptionMode(plan: EditPlanItem[], captionMode?: string, captionDensity?: string): void {

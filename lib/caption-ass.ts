@@ -28,8 +28,8 @@ export const SCRIPT_W = 1080;
 export const SCRIPT_H = 1920;
 
 const MAX_CAPTION_CHARS = 60;
-const H_MARGIN = 96;
-const CAPTION_MAX_W = SCRIPT_W - H_MARGIN * 2;   // 888
+const H_MARGIN = 48;
+const CAPTION_MAX_W = SCRIPT_W - H_MARGIN * 2;   // 984 — 좌우 마진 축소로 폭 예산 확대(기존 888). 한글 medium/large 가 바닥까지 안 깎이도록.
 const V_MARGIN = 130;
 const STACK_GAP_RATIO = 0.42;   // 인접 layer 간 수직 간격 = fontSize × 비율 (동적)
 const STACK_GAP_MIN = 28;
@@ -45,6 +45,10 @@ const STACK_GAP_MIN = 28;
 const SIZE_PT: Record<string, number> = { small: 64, medium: 96, large: 140, huge: 200 };
 // fit 안 되면 줄여나가는 최소치. 시각적 "사이즈 위계" 가 무너지지 않을 정도까지만.
 const MIN_SIZE_PT: Record<string, number> = { small: 50, medium: 62, large: 86, huge: 110 };
+// fit: 폰트를 깎기 전에 \fscx(가로압축)로 폭을 맞춰 ref 의 크기 위계를 보존한다.
+// MIN_SCALEX 까지는 요청 크기를 유지한 채 가로만 압축, 그래도 안 되면 폰트 축소(+ 최후 FLOOR_SCALEX).
+const MIN_SCALEX = 80;
+const FLOOR_SCALEX = 70;
 
 // 외곽선/그림자는 fontSize 에 비례시킨다 (px 고정 → 동적 비율).
 // 큰 자막에는 굵은 외곽선이, 작은 자막에는 얇은 외곽선이 자연스러움.
@@ -62,7 +66,8 @@ export type CaptionLayer = {
   text: string;
   position?: string;            // top | center | bottom (거친 단계)
   vertical_ratio?: number;      // 0.0(맨 위)~1.0(맨 아래) — 정밀 세로 위치. 있으면 이걸 우선해 배치.
-  horizontal_align?: string;    // left | center | right
+  horizontal_ratio?: number;    // 0.0(왼쪽 끝)~1.0(오른쪽 끝) — 정밀 가로 위치(텍스트 블록 중심). 있으면 좌표로 배치.
+  horizontal_align?: string;    // left | center | right (블록 내 줄 정렬 / horizontal_ratio 없을 때의 가로 위치)
   size_level?: string;          // small | medium | large | huge
   color_hex?: string;
   // 한 자막 안에서 색이 중간에 바뀌는 경우(예: "오늘 [특가] 세일"에서 특가만 빨강).
@@ -132,6 +137,7 @@ type Prepared = {
   layer: CaptionLayer;
   lines: string[];
   fontSize: number;
+  scaleX: number;    // ASS ScaleX (가로 압축 %, 100=원본)
   fontFamily: string;
   bold: boolean;
   italic: boolean;
@@ -139,6 +145,7 @@ type Prepared = {
   hAlign: 'left' | 'center' | 'right';
   spacingPx: number;
   blockH: number;
+  blockW: number;
   // 배치 결과
   anchor: number;    // ASS \an code (1~9)
   x: number;
@@ -253,6 +260,10 @@ export function preserveLayerDesign(raw: any): Partial<CaptionLayer> {
   const vr = Number(raw.vertical_ratio);
   if (Number.isFinite(vr) && vr >= 0 && vr <= 1) out.vertical_ratio = vr;
 
+  // 정밀 가로 위치 (0~1) — 있으면 보존해 렌더가 좌표(블록 중심)로 배치 (center 로 뭉개지 않게).
+  const hr = Number(raw.horizontal_ratio);
+  if (Number.isFinite(hr) && hr >= 0 && hr <= 1) out.horizontal_ratio = hr;
+
   // 인라인 색 runs — {text, color_hex} 만 추려 보존 (2개 이상 의미 있을 때).
   if (Array.isArray(raw.color_runs)) {
     const runs = raw.color_runs
@@ -274,6 +285,7 @@ export function sanitizeLayer(raw: any, global: GlobalCaptionStyle): CaptionLaye
   if (!text) return null;
 
   const vr = Number(raw.vertical_ratio);
+  const hr = Number(raw.horizontal_ratio);
   const out: CaptionLayer = {
     text,
     // 인라인 색 runs — {text,color_hex} 2개 이상일 때만 유지 (렌더 시 grapheme 매핑).
@@ -282,6 +294,8 @@ export function sanitizeLayer(raw: any, global: GlobalCaptionStyle): CaptionLaye
       : undefined,
     // 정밀 세로 위치 (0~1) — 있으면 placeLayers 가 고정 마진 대신 이 비율로 배치.
     vertical_ratio: (Number.isFinite(vr) && vr >= 0 && vr <= 1) ? vr : undefined,
+    // 정밀 가로 위치 (0~1) — 있으면 placeLayers 가 정렬 대신 좌표(블록 중심)로 배치.
+    horizontal_ratio: (Number.isFinite(hr) && hr >= 0 && hr <= 1) ? hr : undefined,
     position: String(raw.position || 'bottom').toLowerCase(),
     horizontal_align: String(raw.horizontal_align || 'center').toLowerCase(),
     size_level: String(raw.size_level || global.size_level || 'medium').toLowerCase(),
@@ -367,8 +381,8 @@ function prepareLayer(layer: CaptionLayer, global: GlobalCaptionStyle): Prepared
   // 사이즈 결정 — LLM 의 size_level(=ref 의 의도) 을 우선 존중.
   //   1) layer.size_level (caption planning 이 ref 의 size 를 그대로 복사) 우선
   //   2) 없거나 알 수 없는 값이면 글자수 기준 추천(autoSizeLevel)
-  //   3) fitCaptionForFrame 이 너비를 못 맞추면 같은 size_level 안에서만 폰트만 축소
-  //      (size_level 자체는 보존 — ref 의 "large" 가 우리 결과에서 "small" 로 떨어지지 않게)
+  //   3) 너비가 안 맞으면 폰트를 깎기 전에 \fscx(가로압축)로 먼저 맞춰 요청 크기를 유지
+  //      (그래도 안 되면 줄수 2→3 → 폰트 축소 순. ref 의 "large" 가 결과에서 바닥으로 안 떨어지게)
   // ─────────────────────────────────────────────────────
   const llmLevel = String(layer.size_level || '').toLowerCase();
   const sizeLevel = (llmLevel in SIZE_PT) ? llmLevel : autoSizeLevel(truncated);
@@ -392,10 +406,15 @@ function prepareLayer(layer: CaptionLayer, global: GlobalCaptionStyle): Prepared
     blockH += 2 * (layer.background_padding ?? padding);
   }
 
+  // 블록 가로 폭 — 가로 좌표(horizontal_ratio) 배치 시 화면 밖으로 안 나가게 클램프하는 데 쓴다.
+  const widest = fit.lines.reduce((m, l) => Math.max(m, measureTextWidth(l, fit.fontSize)), 1);
+  const blockW = widest * (fit.scaleX / 100);
+
   return {
     layer,
     lines: fit.lines,
     fontSize: fit.fontSize,
+    scaleX: fit.scaleX,
     fontFamily,
     bold,
     italic,
@@ -403,6 +422,7 @@ function prepareLayer(layer: CaptionLayer, global: GlobalCaptionStyle): Prepared
     hAlign: normalizeHAlign(layer.horizontal_align),
     spacingPx,
     blockH,
+    blockW,
     anchor: 2,
     x: SCRIPT_W / 2,
     y: SCRIPT_H - V_MARGIN,
@@ -431,25 +451,30 @@ function layerVRatio(layer: CaptionLayer): number | null {
   return Number.isFinite(v) && v >= 0 && v <= 1 ? v : null;
 }
 
+// 유효한 horizontal_ratio(0~1) 면 반환, 아니면 null.
+function layerHRatio(layer: CaptionLayer): number | null {
+  const h = Number(layer.horizontal_ratio);
+  return Number.isFinite(h) && h >= 0 && h <= 1 ? h : null;
+}
+
 // ============================================================
 // 멀티 layer 수직 배치 (\an + \pos 좌표 산출)
 // ============================================================
 function placeLayers(items: Prepared[]): void {
+  // 각 layer 의 anchor / x / (vr 있으면 y) 결정.
+  //  - horizontal_ratio 있으면 → x = hr*W, 가로 앵커 center(블록 중심을 좌표에 둠). 없으면 정렬(anchorX).
+  //  - vertical_ratio 있으면   → y = vr*H, 세로 앵커 middle. 없으면 아래 top/center/bottom 스택에서 y 계산.
   for (const p of items) {
-    p.anchor = anchorCode(p.position, p.hAlign);
-    p.x = anchorX(p.hAlign);
+    const hr = layerHRatio(p.layer);
+    const vr = layerVRatio(p.layer);
+    const hMode: 'left' | 'center' | 'right' = hr !== null ? 'center' : p.hAlign;
+    const vMode: 'top' | 'center' | 'bottom' = vr !== null ? 'center' : p.position;
+    p.anchor = anchorCode(vMode, hMode);
+    p.x = hr !== null ? Math.round(hr * SCRIPT_W) : anchorX(p.hAlign);
+    if (vr !== null) p.y = Math.round(vr * SCRIPT_H);
   }
 
-  // ── 원본 정밀 세로위치가 있는 layer: 비율 그대로 배치 (고정 마진 스냅 회피) ──
-  // 블록 세로 중심을 vertical_ratio*화면높이 에 둠 → middle-row anchor 사용.
-  const ratioItems = items.filter(p => layerVRatio(p.layer) !== null);
-  for (const p of ratioItems) {
-    const v = layerVRatio(p.layer)!;
-    p.anchor = 4 + (p.hAlign === 'left' ? 0 : p.hAlign === 'right' ? 2 : 1); // 4/5/6 = vertical center
-    p.y = Math.round(v * SCRIPT_H);
-  }
-
-  // 나머지(정밀 위치 없음)만 기존 top/center/bottom 고정 스택으로.
+  // 나머지(정밀 세로위치 없음)만 기존 top/center/bottom 고정 스택으로.
   const rest = items.filter(p => layerVRatio(p.layer) === null);
   const top = rest.filter(p => p.position === 'top');
   const center = rest.filter(p => p.position === 'center');
@@ -508,6 +533,27 @@ function placeLayers(items: Prepared[]): void {
       p.y = Math.min(Math.max(p.y, safeTop + half), safeBottom - half);
     }
     p.y = Math.round(p.y);
+  }
+
+  // 가로 안전 마진 — anchor 열에 맞춰 블록이 화면 밖으로 안 나가게.
+  const safeLeft = H_MARGIN;
+  const safeRight = SCRIPT_W - H_MARGIN;
+  for (const p of items) {
+    const col = (p.anchor - 1) % 3; // 0=left, 1=center, 2=right
+    const w = p.blockW;
+    if (col === 1) {
+      // center anchor: x = 블록 중심
+      const half = w / 2;
+      const lo = safeLeft + half, hi = safeRight - half;
+      p.x = lo <= hi ? Math.min(Math.max(p.x, lo), hi) : Math.round(SCRIPT_W / 2);
+    } else if (col === 0) {
+      // left anchor: x = 블록 왼쪽 끝
+      p.x = Math.min(Math.max(p.x, safeLeft), Math.max(safeLeft, safeRight - w));
+    } else {
+      // right anchor: x = 블록 오른쪽 끝
+      p.x = Math.max(Math.min(p.x, safeRight), Math.min(safeRight, safeLeft + w));
+    }
+    p.x = Math.round(p.x);
   }
 }
 
@@ -585,7 +631,7 @@ function buildStyleLine(name: string, p: Prepared): string {
     String(bold),
     String(italic),
     '0', '0',
-    '100', '100',
+    String(p.scaleX), '100',
     String(p.spacingPx),
     '0',
     String(borderStyle),
@@ -777,55 +823,81 @@ function truncate(s: string): string {
   return `${chars.slice(0, MAX_CAPTION_CHARS - 1).join('').trimEnd()}...`;
 }
 
-function fitCaptionForFrame(text: string, requestedSize: number, sizeLevel: string): { lines: string[]; fontSize: number } {
-  // ref 자막은 거의 1~2줄. 3줄 강제는 어색해서 통일.
-  // small 만 짧은 문구가 박스 안에 4단까지 들어가는 케이스가 있어 예외 허용 (대신 그래도 cap 2).
-  const maxLines = 2;
+// 텍스트를 줄바꿈하고, ref 의 요청 크기를 최대한 유지한 채 폭을 맞춘다.
+// 우선순위:
+//   A) 요청 크기 유지 — 줄수(2줄, 긴 텍스트면 3줄까지) × 가로압축(\fscx)으로 폭에 맞추기.
+//      줄바꿈만으로 맞으면 압축 없음(scaleX=100). 살짝 넘으면 폰트는 그대로 두고
+//      \fscx 로만 폭을 흡수(scaleX≥MIN_SCALEX) → ref 의 medium/large 가 바닥으로 안 깎임.
+//   B) 그래도 과하면 폰트를 단계 축소(최대 줄수 사용)하며 가로압축 병행.
+//   C) 최후 — minSize + 최대 압축(과압축 방지 하한 FLOOR_SCALEX).
+// 줄수/폰트/압축만 조정하며 text·레이어 구조(형태)는 건드리지 않는다.
+function fitCaptionForFrame(
+  text: string,
+  requestedSize: number,
+  sizeLevel: string,
+): { lines: string[]; fontSize: number; scaleX: number } {
   const minSize = MIN_SIZE_PT[sizeLevel] ?? 60;
-  // 폰트 크기를 5pt 씩 줄여서 fit 시도. 너무 거친 step 이면 한 줄로 안 떨어지는 케이스가 있어 5 로 ↓.
-  for (let size = requestedSize; size >= minSize; size -= 5) {
-    const wrapped = wrapCaptionText(text, size, maxLines);
-    if (wrapped.ok) return { lines: wrapped.lines, fontSize: size };
+  // 긴 한글 캡션은 2줄로 안 떨어져 폰트가 깎이던 주범 → 길면 3줄까지 허용(줄바꿈만, 형태 불변).
+  const nonSpaceLen = graphemes(text).filter(g => !/\s/.test(g)).length;
+  const lineOptions = nonSpaceLen > 12 ? [2, 3] : [2];
+
+  const tryFit = (size: number, maxLines: number): { lines: string[]; fontSize: number; scaleX: number } | null => {
+    const lines = wrapLinesNoTrunc(text, size, maxLines);
+    const widest = maxLineWidth(lines, size);
+    if (widest <= CAPTION_MAX_W) return { lines, fontSize: size, scaleX: 100 };
+    const scaleX = Math.floor((CAPTION_MAX_W / widest) * 100);
+    if (scaleX >= MIN_SCALEX) return { lines, fontSize: size, scaleX: clampNum(scaleX, MIN_SCALEX, 100) };
+    return null;
+  };
+
+  // A) 요청 크기 유지: 2줄 → (긴 텍스트면) 3줄, 각 단계에서 가로압축까지 시도.
+  for (const maxLines of lineOptions) {
+    const hit = tryFit(requestedSize, maxLines);
+    if (hit) return hit;
   }
-  const wrapped = wrapCaptionText(text, minSize, maxLines);
-  return { lines: wrapped.lines, fontSize: minSize };
+
+  // B) 요청 크기로 안 되면 폰트를 줄이며(최대 줄수 사용) 가로압축 병행.
+  const maxLines = lineOptions[lineOptions.length - 1];
+  for (let size = requestedSize - 6; size >= minSize; size -= 6) {
+    const hit = tryFit(size, maxLines);
+    if (hit) return hit;
+  }
+
+  // C) 최후 — minSize + 가능한 최대 압축.
+  const lines = wrapLinesNoTrunc(text, minSize, maxLines);
+  const widest = maxLineWidth(lines, minSize);
+  const scaleX = clampNum(Math.floor((CAPTION_MAX_W / widest) * 100), FLOOR_SCALEX, 100);
+  return { lines, fontSize: minSize, scaleX };
 }
 
-function wrapCaptionText(text: string, fontSize: number, maxLines: number): { ok: boolean; lines: string[] } {
+// 줄바꿈만 수행(truncate 없음). maxLines 를 넘기면 나머지는 마지막 줄에 몰아 담고,
+// 폭 초과분은 호출부가 \fscx 로 흡수한다. (MAX_CAPTION_CHARS 로 길이는 이미 상한돼 있음.)
+function wrapLinesNoTrunc(text: string, fontSize: number, maxLines: number): string[] {
   const normalized = text.replace(/\s+/g, ' ').trim();
-  if (!normalized) return { ok: true, lines: [''] };
+  if (!normalized) return [''];
   const tokens = normalized.split(' ');
   const lines: string[] = [];
   let current = '';
-  let ok = true;
-  const push = () => { if (current) lines.push(current); current = ''; };
-
   for (const token of tokens) {
     const pieces = splitLongToken(token, fontSize);
     for (const piece of pieces) {
       const candidate = current ? `${current} ${piece}` : piece;
-      if (measureTextWidth(candidate, fontSize) <= CAPTION_MAX_W) {
+      if (!current) {
         current = candidate;
-        continue;
-      }
-      push();
-      current = piece;
-      if (lines.length >= maxLines) {
-        ok = false;
-        current = trimToFit(`${piece}...`, fontSize);
-        break;
+      } else if (lines.length < maxLines - 1 && measureTextWidth(candidate, fontSize) > CAPTION_MAX_W) {
+        lines.push(current);
+        current = piece;
+      } else {
+        current = candidate;
       }
     }
-    if (!ok) break;
   }
-  push();
-  if (lines.length > maxLines) {
-    ok = false;
-    const kept = lines.slice(0, maxLines);
-    kept[maxLines - 1] = trimToFit(`${kept[maxLines - 1]}...`, fontSize);
-    return { ok, lines: kept };
-  }
-  return { ok, lines };
+  if (current) lines.push(current);
+  return lines.slice(0, maxLines);
+}
+
+function maxLineWidth(lines: string[], fontSize: number): number {
+  return Math.max(1, ...lines.map(l => measureTextWidth(l, fontSize)));
 }
 
 function splitLongToken(token: string, fontSize: number): string[] {
@@ -843,15 +915,6 @@ function splitLongToken(token: string, fontSize: number): string[] {
   }
   if (current) pieces.push(current);
   return pieces;
-}
-
-function trimToFit(text: string, fontSize: number): string {
-  let out = text;
-  while (graphemes(out).length > 1 && measureTextWidth(out, fontSize) > CAPTION_MAX_W) {
-    const chars = graphemes(out.replace(/\.\.\.$/, ''));
-    out = `${chars.slice(0, -1).join('').trimEnd()}...`;
-  }
-  return out;
 }
 
 function measureTextWidth(text: string, fontSize: number): number {
