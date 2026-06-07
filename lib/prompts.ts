@@ -138,6 +138,7 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
           "text": string,                        // 한 줄 (글자 그대로)
           "position": "top" | "center" | "bottom",
           "vertical_ratio": number,              // 자막 세로 중심 위치 0.0(맨 위)~1.0(맨 아래). position 보다 정밀 — 화면에서 실제 보이는 높이를 정확히 추정 (예: 살짝 위 0.18, 한가운데 0.5, 하단 0.86). 정형화 방지에 중요.
+          "horizontal_ratio": number,            // 자막 가로 중심 위치 0.0(왼쪽 끝)~0.5(중앙)~1.0(오른쪽 끝). horizontal_align 보다 정밀 — 화면에서 실제 보이는 가로 위치를 정확히 추정. 무조건 0.5(center)로 통일하지 말고 실제 위치를 반영.
           "horizontal_align": "left" | "center" | "right",
           "size_level": "small" | "medium" | "large" | "huge",
           "color_hex": string,                   // "#RRGGBB" — 본문(또는 첫 부분) 글자 색
@@ -211,7 +212,7 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
     "outline_color_hex": string,                 // 외곽선 색. "#RRGGBB"
     "outline_thickness": "none" | "thin" | "medium" | "thick",
     "has_shadow": boolean,
-    "has_background_box": boolean,               // 자막 뒤에 박스/박스형 배경
+    "has_background_box": boolean,               // 자막 뒤 '분리된 색 판'(획 사이 여백까지 메워짐)이 있을 때만 true. 글자 자체가 컬러인 건(노란 글씨 등) false — 그 색은 primary_color_hex.
     "background_color_hex": string,              // 배경 박스 색. "#RRGGBB"
     "background_alpha": number,                  // 0~1. 박스 불투명도. 1=완전 불투명, 0.4~0.7=반투명
     "size_level": "small" | "medium" | "large" | "huge"
@@ -240,12 +241,14 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
 규칙:
 - shots 는 시간 순서. shots[i].end == shots[i+1].start.
 - caption_layers 는 컷마다 화면에 보이는 텍스트의 개수만큼 만들어라. 글자가 없으면 빈 배열 [].
-- **레퍼런스에 사이즈/폰트가 다른 2개 텍스트가 동시에 보이면 layers 에 두 개를 모두 분리해서 넣어라.**
-  예: 위에 큰 강조 hook + 아래 작은 부연 설명 → layer 2개
-- **⚠ 1 layer = 화면의 "한 텍스트 덩어리"(같은 크기·위치·줄).** 크기/위치/역할이 다른 텍스트는 절대 한 layer 로 합치지 마라. 합치면 한 layer 의 글자수가 늘어 렌더에서 폰트가 자동 축소돼 **원본보다 작아진다.**
-- **color_runs 는 "한 덩어리 안에서 색만 중간에 바뀌는" 경우 전용** (예: 한 줄 "오늘 [특가] 세일" 중 특가만 빨강). 색이 다르다고 별개의 텍스트를 color_runs 로 묶지 마라 — 그건 위처럼 별도 layer 다. 각 layer 의 크기는 항상 ref 의 그 덩어리 크기를 그대로 유지.
+- **레퍼런스에 사이즈/폰트/색 중 하나라도 다른 2개 이상 텍스트가 동시에 보이면 layers 에 모두 분리해서 넣어라.**
+  예1: 위에 큰 강조 hook + 아래 작은 부연 설명 → layer 2개
+  예2: 윗줄 흰색 "요즘 날씨에 가기 좋은" + 아랫줄 노란색 "기린이찌방 한강점" → 색이 다르므로 layer 2개 (각 layer color_hex 를 그 줄 색으로)
+- **⚠ 1 layer = 화면의 "한 텍스트 덩어리"(같은 크기·위치·색·줄).** 크기/위치/색/역할이 다른 텍스트는 절대 한 layer 로 합치지 마라. 특히 **색이 다른 줄은 강력한 분리 신호다 — \n 으로 한 layer 에 합치지 마라** (합치면 한쪽 색이 사라져 박스로 오인되거나, 글자수가 늘어 렌더에서 폰트가 자동 축소돼 원본보다 작아진다).
+- **color_runs 는 "한 덩어리(한 줄) 안에서 색만 중간에 바뀌는" 경우 전용** (예: 한 줄 "오늘 [특가] 세일" 중 특가만 빨강). 줄이 통째로 색이 다르면 color_runs 가 아니라 별도 layer 다. 각 layer 의 크기는 항상 ref 의 그 덩어리 크기를 그대로 유지.
 - size_level (각 layer): 그 글자가 화면 너비에서 차지하는 비율로 추정.
   · 1/4 미만 = "small" / 1/4~1/2 = "medium" / 1/2~3/4 = "large" / 3/4↑ = "huge"
+  · 강조 hook(가장 크고 먼저 띄는 텍스트)은 거의 항상 large/huge — 길다고 습관적으로 medium 으로 낮추지 마라. caption_pattern.size_contrast 를 dramatic/alternating 으로 적었다면 layer 들 size 가 전부 같을 수 없다(큰 것+작은 것 혼재).
 - color_hex: 흰색 "#FFFFFF", 검정 "#000000", 노란 강조 "#FFE600" 등 정확히 추정.
 - font_category: 가장 가까운 카테고리. 굵은 산세리프=sans+bold, 세리프=serif, 손글씨/필기체=handwritten,
   가로폭 좁은 압축형=condensed, 둥근 곡선=rounded, 거대한 임팩트 폰트=display.
@@ -264,8 +267,13 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
   · handwritten_brush   — 붓글씨/유려한 필기체 (Nanum Brush / Nanum Pen 류)
   · display_decorative  — 장식적/유니크 디스플레이, 캐릭터성 강함 (Cute Font / Kirang Haerang 류)
 - italic: 글자가 시각적으로 기울어져 있으면 true. 굵기와 별개. 한국어 영상에서는 드물지만 영문/숫자 자막에서는 흔하다.
-- horizontal_align: 화면 좌/중/우 어디에 정렬됐는지 추정 (그냥 center 만 쓰지 말고 실제 위치 반영).
-- position: 화면 상단(=top), 중앙(=center), 하단(=bottom).
+- **자막 위치 (position / vertical_ratio / horizontal_align) — 컷마다 실제 보이는 위치를 정직하게 측정해라.**
+  · position: 화면 상단(=top), 중앙(=center), 하단(=bottom).
+  · vertical_ratio: 자막 세로 중심의 실제 높이 (0=맨 위 ~ 1=맨 아래). position 보다 정밀하니 화면에 보이는 그대로. 예) 상단 로고자막 0.12, 중앙 훅 0.5, 하단 설명 0.86.
+  · horizontal_ratio: 자막 가로 중심의 실제 위치 (0=왼쪽 끝 ~ 0.5=중앙 ~ 1=오른쪽 끝). 화면에 보이는 그대로 숫자로. 예) 왼쪽 정렬 0.28, 가운데 0.5, 오른쪽 0.72. **무조건 0.5 로 채우지 마라** — 실제로 왼/오른쪽에 치우쳤으면 그 값을.
+  · horizontal_align: 블록 내 줄 정렬(좌/중/우). 실제 정렬을 반영하고 그냥 center 로 통일하지 마라.
+  · ⚠ **모든 컷을 같은 위치(예: 전부 bottom/center/0.85)로 채우지 마라 — 특별한 이유 없이 균일하게 답하는 건 거의 항상 관찰 오류다.** 자막이 컷마다 다른 높이/정렬에 있으면 그 차이를 반드시 반영하고, 정말로 영상이 전부 같은 위치일 때만 동일하게 답해라.
+  · caption_pattern.position_variety 는 위 shots 의 실제 position/vertical_ratio 분포와 일치시켜라 (전부 하단=all_bottom, 대부분 하단=mostly_bottom, 섞임=varied, 전부 상단=all_top).
 - required_tags 는 영어 snake_case (예: ["food","close_up","indoor","slow_motion"]).
 - caption_global_style 은 자막이 화면에 한 번이라도 등장하면 반드시 모든 필드 채워라.
   · 자막이 전혀 없으면 빈 값으로 두지 말고 합리적 기본값으로 채워라 (흰 글자, 검정 외곽선, 중간 크기, sans, bold).
@@ -281,11 +289,12 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
 
   · outline (글자 테두리): 글자 가장자리에 다른 색 윤곽선이 보이면 outline_color_hex 채우고 outline_thickness 정함. 윤곽선 없으면 outline_thickness="none". 글자색이 흰색이면 outline 은 보통 검정, 글자색이 검정이면 outline 은 보통 흰색.
   · shadow (그림자): 글자 아래/뒤로 떨어지는 그림자가 보이면 has_shadow=true. 또렷한 한 방향 그림자면 shadow_blur=0~3, 부드럽게 퍼지면 8~20.
-  · **background_box (박스 배경)**: 글자 뒤에 검정/유색 박스가 깔려있으면 has_background_box=true.
-    박스가 시각적으로 거의 안 보이면 has_background_box=false.
+  · **background_box (박스 배경)**: 글자 뒤로 **글자보다 넓은 사각/알약형 색 면(획 사이 여백까지 같은 색으로 메워진 판)** 이 깔려 그 위에 다른 색 글자가 얹혔을 때만 has_background_box=true.
+    박스가 시각적으로 거의 안 보이면 false.
+    ⚠ **글자 '획' 자체가 노랑/빨강 등 유채색인 것은 박스가 아니라 '색 글씨'다 → has_background_box=false 로 두고 그 색을 color_hex 에 넣어라.** 검정으로 보이는 건 보통 글자가 아니라 외곽선(outline)이다. 글자색=박스색(노란 글씨를 노란 박스로)인 답은 거의 항상 오판.
   · background_alpha: 박스 불투명도. 또렷한 솔리드 박스 = 1.0, 영상이 살짝 비치는 반투명 = 0.4~0.7, 거의 안 보이는 흐릿한 박스 = 0.2~0.3. 박스가 없으면(=false) 무시.
   · background_radius: 모서리가 각지면 0, 살짝 둥글면 12~16, 알약형이면 999.
-  · background_color_hex: 박스 색은 글자와 명도가 명확히 차이나는 색. 흰 글자에 흰 박스 같은 답 금지.
+  · background_color_hex: has_background_box=true 일 때만 채운다(false 면 ""). 박스 색은 '글자 획 사이 여백까지 채운 분리된 사각 면'의 색이며 글자색과 명도가 달라야 한다(흰 글자에 흰 박스 금지). 글자 자체가 컬러인 것을 여기 넣지 마라 — 그건 color_hex 다.
   · gradient (글자 자체 그라데이션): **글자 안에서 색이 변하면 type="linear" + stops 정확히**. 예) 위 빨강 → 아래 노랑이면 angle=0 + stops=[{offset:0,color:"#FF0000"},{offset:1,color:"#FFE600"}]. 그라데이션 없으면 type="none", stops=[].
   · glow (글로우/네온): 글자 가장자리에서 같은 색 또는 살짝 다른 색이 빛나듯 퍼지면 has_glow=true. 네온 사인이나 노을빛 느낌이 단서.
   · letter_spacing: 자간이 일반보다 좁아 보이면 "tight", 일반은 "normal", 넓게 띄워져 있으면 "wide".
@@ -294,6 +303,7 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
 - **자가 검증 — caption_layers 작성 후 다음 질문에 모두 "예" 인지 확인:**
   · 글자색과 배경의 명도 차이가 충분한가? 아니라면 outline_thickness 또는 has_background_box 둘 중 하나는 켜져 있나?
   · outline_color_hex 는 글자색과 명도가 충분히 다른가? (흰 글자에 회색 외곽선 같은 답 금지)
+  · 모든 컷의 position/horizontal_align/vertical_ratio 를 똑같은 값으로 답하지 않았는가? 균일하게 적었다면 영상이 정말 그런지 컷별 높이를 다시 확인해라.
 - **신규 디자인 필드들도 caption_global_style 의 has_outline/outline_color 와 일치해야 자연스럽다.** layer 별 outline 이 다른 영상이 아니면 모든 layer 의 outline_color_hex 가 동일.
 - 절대 JSON 외 텍스트 출력 금지.`;
 
@@ -410,6 +420,15 @@ export const REFERENCE_TEXT_FOCUSED_PROMPT = `너는 영상 OCR + 디자인 분�
 shot_index 는 영상의 시각적 컷 순서로 0 부터 매기고, shot_start / shot_end 는 그 컷의 시간(초).
 텍스트 없는 컷은 layers: [] 로 포함.
 
+각 layer 의 position / vertical_ratio / horizontal_ratio / horizontal_align 은 화면에서 자막이 실제로 보이는 위치 그대로 채워라.
+⚠ 모든 컷을 같은 위치(전부 bottom/center/동일 vertical_ratio/horizontal_ratio=0.5)로 통일하지 마라 — 컷마다 위치가 다르면 그 차이를 반영하고(특히 가로로 왼/오른쪽 치우침은 horizontal_ratio 로), 정말 균일할 때만 동일하게. caption_pattern.position_variety 도 실제 분포와 일치시켜라.
+
+자막 "형태"를 정확히 잡아라 (가장 흔한 오류이니 엄격히):
+- **색깔 글씨 vs 박스 구분**: has_background_box=true 는 '글자 뒤로 글자보다 넓은 사각/알약형 색 면(획 사이 여백까지 같은 색으로 메워진 판)'이 있고 그 위에 다른 색 글자가 얹혔을 때만. ⚠ 글자 '획' 자체가 노랑/빨강 등 유채색이면 박스가 아니라 '색 글씨'다 → has_background_box=false, background_color_hex="", 그 색을 color_hex 에. 검정으로 보이는 건 보통 글자가 아니라 외곽선(outline)이다. 글자색=박스색(노란 글씨를 노란 박스로)인 답은 거의 항상 오판.
+- **색/스타일 다른 줄 분리**: 1 layer = 같은 색·크기·줄의 한 덩어리. 색이 다르거나(예: 윗줄 흰색 "요즘 날씨에 가기 좋은" + 아랫줄 노란색 "기린이찌방 한강점") 크기·역할이 다르면 반드시 별도 layer 로 분리하고 각 layer color_hex 를 그 줄 색으로. **절대 \n 으로 한 layer 에 합치지 마라.** (한 줄 안에서 일부 단어만 색이 바뀔 때만 color_runs.)
+- **size_level**: 그 한 덩어리가 화면 너비에서 차지하는 비율 — 1/4미만 small / 1/4~1/2 medium / 1/2~3/4 large / 3/4↑ huge. 강조 hook 은 거의 항상 large/huge(습관적 medium 금지). size_contrast 를 dramatic 으로 적었으면 size 가 전부 같을 수 없다.
+- **자가검증**: (1) box=true 라면 글자 사이 여백까지 칠해진 판이 정말 보이나? 아니면 색 글씨다. (2) 색 다른 줄을 한 layer 로 합치지 않았나? (3) layers 개수가 caption_pattern.layer_count_typical 과 모순되지 않나?
+
 응답 JSON 만, 다른 텍스트 금지:
 
 {
@@ -423,6 +442,7 @@ shot_index 는 영상의 시각적 컷 순서로 0 부터 매기고, shot_start 
           "text": string,
           "position": "top" | "center" | "bottom",
           "vertical_ratio": number,              // 자막 세로 중심 위치 0.0(맨 위)~1.0(맨 아래). position 보다 정밀 — 화면에서 실제 보이는 높이를 정확히 추정 (예: 살짝 위 0.18, 한가운데 0.5, 하단 0.86). 정형화 방지에 중요.
+          "horizontal_ratio": number,            // 자막 가로 중심 위치 0.0(왼쪽 끝)~0.5(중앙)~1.0(오른쪽 끝). horizontal_align 보다 정밀 — 화면에서 실제 보이는 가로 위치를 정확히 추정. 무조건 0.5(center)로 통일하지 말고 실제 위치를 반영.
           "horizontal_align": "left" | "center" | "right",
           "size_level": "small" | "medium" | "large" | "huge",
           "color_hex": string,
@@ -441,8 +461,8 @@ shot_index 는 영상의 시각적 컷 순서로 0 부터 매기고, shot_start 
           "has_shadow": boolean,
           "shadow_color_hex": string,
           "shadow_blur": number,
-          "has_background_box": boolean,
-          "background_color_hex": string,
+          "has_background_box": boolean,         // 글자 뒤 '분리된 색 판'(획 사이 여백까지 메워짐)이 있을 때만 true. 글자 자체가 컬러인 건 false.
+          "background_color_hex": string,        // box=true 일 때만. false 면 "". 글자색은 color_hex 에.
           "background_alpha": number,
           "background_radius": number,
           "gradient": { "type": "linear" | "none", "angle": number, "stops": [ { "offset": number, "color": string } ] },
@@ -501,6 +521,35 @@ export function buildCaptionPlanningPrompt(args: {
   }[];
   extraFeedback?: string;
 }): string {
+  // ref layer 의 "색" 디자인을 LLM 에 그대로 노출한다 (작성지침의 '그대로 복사'가 실효를 갖도록).
+  // 박스/외곽선/그라데이션/글로우/color_runs 는 이전엔 프롬프트 어디에도 안 보여 LLM 이
+  // 재현할 수 없었다 → 흰 글씨·박스 없음으로 표류하던 핵심 원인. (값 없으면 토큰 절약 위해 생략.)
+  const layerColorBits = (l: any): string => {
+    const parts: string[] = [];
+    if (l.color_hex) parts.push(`color=${l.color_hex}`);
+    if (l.has_background_box) parts.push(`box=${l.background_color_hex || '#000000'}`);
+    if (l.outline_color_hex && l.outline_thickness && l.outline_thickness !== 'none') {
+      parts.push(`outline=${l.outline_color_hex}(${l.outline_thickness})`);
+    }
+    if (l.gradient && Array.isArray(l.gradient.stops) && l.gradient.stops.length > 0) {
+      parts.push(`grad=${l.gradient.stops.map((s: any) => s.color).filter(Boolean).join('>')}`);
+    }
+    if (l.has_glow && l.glow_color_hex) parts.push(`glow=${l.glow_color_hex}`);
+    if (Array.isArray(l.color_runs) && l.color_runs.length >= 2) {
+      parts.push(`runs=${l.color_runs.map((r: any) => r.color_hex).filter(Boolean).join('|')}`);
+    }
+    return parts.join(' ');
+  };
+  // ref layer 의 정밀 위치(0~1) 노출. top/center/bottom·center 로 뭉개지 말고 이 좌표를 유지하도록.
+  const layerPosBits = (l: any): string => {
+    const parts: string[] = [];
+    const v = Number(l.vertical_ratio);
+    if (Number.isFinite(v) && v >= 0 && v <= 1) parts.push(`vr=${v.toFixed(2)}`);
+    const h = Number(l.horizontal_ratio);
+    if (Number.isFinite(h) && h >= 0 && h <= 1) parts.push(`hr=${h.toFixed(2)}`);
+    return parts.join(' ');
+  };
+
   const refLines = args.refCutsWithLayers
     .filter(c => Array.isArray(c.layers) && c.layers.length > 0)
     .map(c => {
@@ -511,7 +560,9 @@ export function buildCaptionPlanningPrompt(args: {
           l.emphasis,
           l.italic ? 'italic' : null,
         ].filter(Boolean).join('/');
-        return `   · ${l.position}/${l.horizontal_align}/${l.size_level}/${styleBits}/${l.color_hex} [${l.role}/${l.tone}] "${l.text}"`;
+        const cb = layerColorBits(l);
+        const pb = layerPosBits(l);
+        return `   · ${l.position}/${l.horizontal_align}/${l.size_level}/${styleBits}${cb ? ' ' + cb : ''}${pb ? ' ' + pb : ''} [${l.role}/${l.tone}] "${l.text}"`;
       }).join('\n');
       return `cut ${c.idx} (${c.layers.length}개 텍스트):\n${ll}`;
     }).join('\n');
@@ -521,7 +572,9 @@ export function buildCaptionPlanningPrompt(args: {
       .map((l: any) => {
         const bits = [l.position, l.size_level, l.font_category, l.font_personality, l.italic ? 'italic' : null]
           .filter(Boolean).join('/');
-        return `${bits}[${l.role}]`;
+        const cb = layerColorBits(l);
+        const pb = layerPosBits(l);
+        return `${bits}${cb ? ' ' + cb : ''}${pb ? ' ' + pb : ''}[${l.role}]`;
       })
       .join(' + ');
     const safePosition = suggestSafeCaptionPosition(c.subject_center_y);
@@ -663,6 +716,7 @@ ${cutLines}
      · letter_spacing, entry_animation
      · color_runs (글자 중간에 색이 바뀌는 패턴 — ref 에 있으면 같은 구조로, text 만 우리 카피에 맞춰 바꿔라)
      · vertical_ratio (자막 세로 위치 0~1 — ref 가 둔 높이를 그대로. top/center/bottom 으로 뭉개지 말고 실제 비율 유지)
+     · horizontal_ratio (자막 가로 위치 0~1 — ref 가 둔 가로 위치를 그대로. 무조건 0.5(center)로 뭉개지 말 것)
    - **임의로 디자인 값 만들어내지 마라.** ref 와 시각적으로 다르면 매칭의 의미가 사라진다.
    - matched_ref_layers 가 비어있는 컷에서 자막을 새로 만들 때는 caption_global_style 의 has_outline / outline_color_hex / has_shadow / has_background_box / primary_color_hex 등을 따라가라.
    - 사용자 styleNote 가 명시적으로 "박스 배경 빼라" 같은 지시를 했을 때만 변형.
@@ -681,6 +735,7 @@ JSON 만 출력. 다른 텍스트 금지.
           "text": string,
           "position": "top" | "center" | "bottom",
           "vertical_ratio": number,              // 자막 세로 중심 위치 0.0(맨 위)~1.0(맨 아래). position 보다 정밀 — 화면에서 실제 보이는 높이를 정확히 추정 (예: 살짝 위 0.18, 한가운데 0.5, 하단 0.86). 정형화 방지에 중요.
+          "horizontal_ratio": number,            // 자막 가로 중심 위치 0.0(왼쪽 끝)~0.5(중앙)~1.0(오른쪽 끝). horizontal_align 보다 정밀 — 화면에서 실제 보이는 가로 위치를 정확히 추정. 무조건 0.5(center)로 통일하지 말고 실제 위치를 반영.
           "horizontal_align": "left" | "center" | "right",
           "size_level": "small" | "medium" | "large" | "huge",
           "color_hex": string,
@@ -699,8 +754,8 @@ JSON 만 출력. 다른 텍스트 금지.
           "has_shadow": boolean,
           "shadow_color_hex": string,
           "shadow_blur": number,
-          "has_background_box": boolean,
-          "background_color_hex": string,
+          "has_background_box": boolean,         // 글자 뒤 '분리된 색 판'(획 사이 여백까지 메워짐)이 있을 때만 true. 글자 자체가 컬러인 건 false.
+          "background_color_hex": string,        // box=true 일 때만. false 면 "". 글자색은 color_hex 에.
           "background_alpha": number,
           "background_radius": number,
           "gradient": { "type": "linear" | "none", "angle": number, "stops": [ { "offset": number, "color": string } ] },
