@@ -1278,3 +1278,60 @@ ${list}
   "selected": [number]   // 최종 컷 id 들을 "재생 순서대로". 위 규칙을 만족하는 부분집합.
 }`;
 }
+
+// ============================================================
+// 유료/유명 BGM 추천 프롬프트 (BGM 선택 화면)
+// ----------------------------------------------------------------
+// audio_profile(분위기) + (있으면) 레퍼런스 원곡의 장르/발매시대를 앵커로,
+// 영상에 어울리는 "실제로 존재하는 유명/대중적인 곡" top N 을 추천.
+// 릴스/숏폼에서 자주 쓰이는, 누구나 알 법한 곡 위주. (정보/추천용 — 임베드 아님)
+// ============================================================
+export function buildFamousBgmPrompt(
+  profile: {
+    bgm_mood?: string; bgm_genre?: string; bgm_tempo?: string; bgm_energy?: string;
+    bgm_instruments?: string[];
+  },
+  reference?: {
+    title?: string; artist?: string; genres?: string[]; release_date?: string;
+  },
+  count = 3,
+): string {
+  const p = profile || {};
+  const insts = Array.isArray(p.bgm_instruments) ? p.bgm_instruments.filter(Boolean).join(', ') : '';
+  const refLine = reference && (reference.title || (reference.genres && reference.genres.length))
+    ? `\n[레퍼런스 원곡 — 이 결/시대를 따라가라]\n` +
+      `- 곡: ${reference.title || '?'}${reference.artist ? ` / ${reference.artist}` : ''}\n` +
+      `- 장르: ${(reference.genres || []).join(', ') || '?'}\n` +
+      `- 발매: ${reference.release_date || '?'}\n` +
+      `→ 이 곡과 "비슷한 분위기·장르·시대"의 다른 유명 곡들을 추천해라. (레퍼런스 원곡 자체는 제외)\n`
+    : '';
+
+  return `너는 숏폼(인스타 릴스/유튜브 쇼츠) 영상에 BGM 을 골라주는 음악 큐레이터다.
+아래 영상 분위기에 어울리는, "실제로 존재하는 유명하고 대중적인 곡" ${count}개를 추천해라.
+
+[영상 BGM 분위기]
+- 무드: ${p.bgm_mood || '?'}
+- 장르: ${p.bgm_genre || '?'}
+- 템포: ${p.bgm_tempo || '?'}
+- 에너지: ${p.bgm_energy || '?'}
+- 악기: ${insts || '?'}
+${refLine}
+규칙:
+- **실재하는 유명 곡만.** 누구나 들으면 알 법한 대중적인 곡, 특히 릴스/숏폼에서 자주 쓰이는 곡 위주. 가공의 곡/아티스트를 지어내지 마라.
+- 분위기(무드·장르·템포·에너지)에 실제로 어울리는 곡으로. 레퍼런스 원곡 정보가 있으면 그 장르·시대(연도대)에 맞춰라.
+- ${count}개 모두 서로 다른 곡/아티스트로 다양하게.
+- 각 곡에 왜 이 영상에 어울리는지 한 줄(reason)을 한국어로.
+
+아래 JSON 스키마로만 출력. 다른 텍스트/마크다운/코드펜스 금지.
+{
+  "tracks": [
+    {
+      "title": string,      // 곡 제목 (정확히)
+      "artist": string,     // 아티스트
+      "year": string,       // 발매 연도(대략) "2019" 등, 모르면 ""
+      "genre": string,      // 장르
+      "reason": string      // 이 영상에 어울리는 이유 (한국어, 한 줄)
+    }
+  ]
+}`;
+}
