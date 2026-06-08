@@ -67,6 +67,8 @@ export const ARTIFACTS = {
   captionedMp4: (pid: string) => path.join(stageDir(pid, 3), 'captioned.mp4'),
   finalMp4: (pid: string) => path.join(stageDir(pid, 4), 'final.mp4'),
   bgmIdentity: (pid: string) => path.join(stageDir(pid, 4), 'bgm-identity.json'),
+  // 사용자의 BGM 선택 결정. { none: true } 면 BGM 없이 진행(자동 다운로드 금지).
+  bgmPick: (pid: string) => path.join(stageDir(pid, 4), 'bgm-pick.json'),
   ttsConfig: (pid: string) => path.join(projectDir(pid), 'tts-config.json'),
   ttsOutline: (pid: string) => path.join(projectDir(pid), 'tts-outline.json'),
   audioConfig: (pid: string) => path.join(projectDir(pid), 'audio-config.json'),

@@ -455,6 +455,8 @@ app.post('/api/bgm-pick', async (c) => {
   }
 
   if (body.none === true) {
+    // 사용자가 명시적으로 "BGM 없이 진행" 선택 → Stage 4 가 자동 다운로드하지 않도록 플래그 저장.
+    await writeJson(ARTIFACTS.bgmPick(projectId), { none: true, at: new Date().toISOString() });
     return c.json({ ok: true, mode: 'none' });
   }
 
@@ -466,6 +468,8 @@ app.post('/api/bgm-pick', async (c) => {
   const destPath = path.join(dir, safeName);
   try {
     await downloadBgmTrack(sourceUrl, destPath);
+    // 실제 음원을 골랐으므로 이전 "none" 플래그 해제.
+    await writeJson(ARTIFACTS.bgmPick(projectId), { none: false, at: new Date().toISOString() });
     return c.json({ ok: true, mode: 'picked', filename: safeName, title: body.title || null });
   } catch (e: any) {
     return c.json({ error: '다운로드 실패: ' + (e?.message || String(e)) }, 502);

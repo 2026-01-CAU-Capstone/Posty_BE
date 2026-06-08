@@ -97,9 +97,18 @@ export async function runStage4(projectId: string): Promise<{
   const spec: any = await readJson(ARTIFACTS.editSpec(projectId));
   const audioProfile: AudioProfile = spec?.audio_profile || {};
 
+  // 사용자가 "BGM 없이 진행"을 명시적으로 골랐는지 확인 (bgm-pick.json). true 면 자동 다운로드도 금지.
+  const bgmPick: any = await readJson(ARTIFACTS.bgmPick(projectId));
+  const userChoseNoBgm = bgmPick?.none === true;
+
   if (uploaded.length > 0) {
     bgms = uploaded;
     bgmSource = 'uploaded';
+  } else if (userChoseNoBgm) {
+    // 명시적 "BGM 없이 진행" — 남은 archive 트랙 청소 후, 어떤 BGM 도 입히지 않는다.
+    for (const p of oldArchive) await fs.rm(p, { force: true });
+    bgms = [];
+    await appendRawResponse(projectId, { stage: 4, kind: 'bgm_skipped_user_none' });
   } else {
     for (const p of oldArchive) await fs.rm(p, { force: true });
     if (audioProfile.has_bgm === false) {

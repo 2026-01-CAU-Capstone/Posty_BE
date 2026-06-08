@@ -196,8 +196,15 @@ export async function runStage1(projectId: string): Promise<{
   // 목표 길이는 컷편집 옵션(cut-config) 우선, 미지정이면 레퍼런스 길이(없으면 45초).
   const cutCfg = await readCutConfig(projectId);
   const { targetSec, minSec, maxSec } = resolveTargetRange(cutCfg, Number(spec?.duration), TARGET_SEC);
+  // 예상 컷 길이: 이제 각 컷은 매칭된 ref 컷 길이를 따라가므로(평균 ≈ 레퍼런스 평균 컷 길이),
+  // budget 추정/축약(reduce)도 같은 기준으로 잡아야 과도하게 reduce 되지 않는다.
+  // (예전엔 컷당 최대 4.5초로 추정 → 빠른 레퍼런스에서 timeline 을 과대평가해 멀쩡한 컷까지 버렸다.)
+  const refDurs: number[] = spec.shots.map((s: any) => Math.max(0.05, (Number(s.end) || 0) - (Number(s.start) || 0)));
+  const avgRefCutDur = refDurs.length
+    ? Math.max(MIN_CUT_DUR, Math.min(MAX_CUT_DUR, refDurs.reduce((a, b) => a + b, 0) / refDurs.length))
+    : MAX_CUT_DUR;
   const estimatedSec = srcEntries.reduce(
-    (sum, e) => sum + Math.max(0.05, Math.min(e.s.end - e.s.start, MAX_CUT_DUR)), 0,
+    (sum, e) => sum + Math.max(0.05, Math.min(e.s.end - e.s.start, avgRefCutDur)), 0,
   );
   if (estimatedSec > maxSec) {
     const userDirectionBlock = styleNote.trim() ? styleNote.trim() : undefined;
@@ -212,8 +219,9 @@ export async function runStage1(projectId: string): Promise<{
       tags: e.s.tags,
     }));
     const reduced = await reduceSourceShots(cands, srcVecs, {
+      // reduce 의 컷 길이 추정도 ref 평균 컷 길이 기준으로 — 실제 렌더 길이와 정합.
       targetSec, minSec, maxSec,
-      maxCutDur: MAX_CUT_DUR, userDirectionBlock,
+      maxCutDur: avgRefCutDur, userDirectionBlock,
     });
     await appendRawResponse(projectId, {
       stage: 1, kind: 'source_reduction',
@@ -253,7 +261,10 @@ export async function runStage1(projectId: string): Promise<{
     }
     const ref = spec.shots[bestRefIdx];
 
-    const win = pickWindow(e.s);
+    // 매칭된 ref 컷의 길이로 이 컷의 길이를 구동한다 → 레퍼런스의 빠른 템포/리듬 재현.
+    // (이 ref 에서 STYLE 도 빌려오므로, 그 ref 컷의 (end-start) 가 곧 이 컷의 목표 길이.)
+    const refDur = Math.max(0.05, (Number(ref.end) || 0) - (Number(ref.start) || 0));
+    const win = pickWindow(e.s, refDur);
     const useDur = Math.max(0.05, win.end - win.start);
 
     plan.push({
@@ -842,58 +853,67 @@ export function reinjectRefStyle(planned: CaptionLayer[], ref?: CaptionLayer[]):
   // planned ↔ ref 레이어 매칭: 색이 가장 가까운 ref(흰↔흰, 노랑↔노랑)를 우선 매칭하고, 실패 시 인덱스.
   // (이전엔 ref[k] 인덱스로만 매칭 → ref 레이어 순서가 다른 컷에서 두 자막의 색/위치가 뒤바뀌었다.)
   const usedRef = new Set<number>();
-  const pickRef = (p: CaptionLayer, k: number): CaptionLayer | undefined => {
+  // colorOk=true 면 색이 충분히 가까워 매칭된 것(흰↔흰) → 색 재주입 안전.
+  // colorOk=false 면 색이 멀어 인덱스로만 폴백한 것 → 색을 덮으면 흰 자막이 ref 색(검정/노랑)으로
+  // 바뀌어 사라진다. 이 경우 위치/크기만 빌리고 색 계열 필드는 건드리지 않는다.
+  const pickRef = (p: CaptionLayer, k: number): { r: CaptionLayer; colorOk: boolean } | undefined => {
     let best = -1, bestD = 0.18;
     for (let j = 0; j < ref.length; j++) {
       if (usedRef.has(j)) continue;
       const d = colorDistance(p.color_hex, ref[j].color_hex);
       if (d < bestD) { bestD = d; best = j; }
     }
-    if (best >= 0) { usedRef.add(best); return ref[best]; }
-    if (k < ref.length && !usedRef.has(k)) { usedRef.add(k); return ref[k]; }
+    if (best >= 0) { usedRef.add(best); return { r: ref[best], colorOk: true }; }
+    if (k < ref.length && !usedRef.has(k)) { usedRef.add(k); return { r: ref[k], colorOk: false }; }
     return undefined;
   };
 
   return planned.map((p, k) => {
-    const r = pickRef(p, k);
-    if (!r || typeof r !== 'object') return p; // 매칭 ref layer 없음 → LLM 값 유지(이후 global 폴백)
+    const picked = pickRef(p, k);
+    if (!picked || typeof picked.r !== 'object') return p; // 매칭 ref layer 없음 → LLM 값 유지(이후 global 폴백)
+    const r = picked.r;
     const out: CaptionLayer = { ...p };
 
     // ── 색 (형태 무관) ──
-    const colorHex = str(r.color_hex);
-    if (colorHex) out.color_hex = colorHex;
-    if (typeof r.has_background_box === 'boolean') out.has_background_box = r.has_background_box;
-    const boxColor = str(r.background_color_hex);
-    if (boxColor) out.background_color_hex = boxColor;
-    if (Number.isFinite(r.background_alpha as number)) out.background_alpha = r.background_alpha;
-    if (Number.isFinite(r.background_padding as number)) out.background_padding = r.background_padding;
-    const outlineColor = str(r.outline_color_hex);
-    if (outlineColor) out.outline_color_hex = outlineColor;
-    const outlineThickness = str(r.outline_thickness);
-    if (outlineThickness) out.outline_thickness = outlineThickness;
-    if (typeof r.has_shadow === 'boolean') out.has_shadow = r.has_shadow;
-    const shadowColor = str(r.shadow_color_hex);
-    if (shadowColor) out.shadow_color_hex = shadowColor;
-    // 그림자 기하(흐림/오프셋) — ref 그대로 재주입해야 부드러운 그림자/헤일로가 렌더까지 살아남는다.
-    // (이전엔 재주입 대상이 아니어서 plan 후 sanitize 기본값 blur=무시 / offset y=4 로 뭉개졌다.)
-    if (Number.isFinite(r.shadow_blur as number)) out.shadow_blur = r.shadow_blur;
-    if (Number.isFinite(r.shadow_offset_x as number)) out.shadow_offset_x = r.shadow_offset_x;
-    if (Number.isFinite(r.shadow_offset_y as number)) out.shadow_offset_y = r.shadow_offset_y;
-    if (typeof r.has_glow === 'boolean') out.has_glow = r.has_glow;
-    const glowColor = str(r.glow_color_hex);
-    if (glowColor) out.glow_color_hex = glowColor;
-    if (Number.isFinite(r.glow_radius as number)) out.glow_radius = r.glow_radius;
-    if (r.gradient && typeof r.gradient === 'object') out.gradient = r.gradient;
-    // 글자 모양 힌트 — ref 의 폰트 인상을 따르도록 재주입 (형태 무관).
+    // 색이 충분히 가까워 매칭된 경우(colorOk)에만 색 계열 필드를 재주입한다.
+    // 색이 멀어 인덱스로만 폴백한 경우엔 색을 덮지 않는다 — 안 그러면 흰 자막(#FFFFFF)이
+    // ref 의 강조색/검정으로 덮여 사라진다(예: 흰 훅 → ref 검정 → 어두운 배경에서 안 보임).
+    if (picked.colorOk) {
+      const colorHex = str(r.color_hex);
+      if (colorHex) out.color_hex = colorHex;
+      if (typeof r.has_background_box === 'boolean') out.has_background_box = r.has_background_box;
+      const boxColor = str(r.background_color_hex);
+      if (boxColor) out.background_color_hex = boxColor;
+      if (Number.isFinite(r.background_alpha as number)) out.background_alpha = r.background_alpha;
+      if (Number.isFinite(r.background_padding as number)) out.background_padding = r.background_padding;
+      const outlineColor = str(r.outline_color_hex);
+      if (outlineColor) out.outline_color_hex = outlineColor;
+      const outlineThickness = str(r.outline_thickness);
+      if (outlineThickness) out.outline_thickness = outlineThickness;
+      if (typeof r.has_shadow === 'boolean') out.has_shadow = r.has_shadow;
+      const shadowColor = str(r.shadow_color_hex);
+      if (shadowColor) out.shadow_color_hex = shadowColor;
+      // 그림자 기하(흐림/오프셋) — ref 그대로 재주입해야 부드러운 그림자/헤일로가 렌더까지 살아남는다.
+      // (이전엔 재주입 대상이 아니어서 plan 후 sanitize 기본값 blur=무시 / offset y=4 로 뭉개졌다.)
+      if (Number.isFinite(r.shadow_blur as number)) out.shadow_blur = r.shadow_blur;
+      if (Number.isFinite(r.shadow_offset_x as number)) out.shadow_offset_x = r.shadow_offset_x;
+      if (Number.isFinite(r.shadow_offset_y as number)) out.shadow_offset_y = r.shadow_offset_y;
+      if (typeof r.has_glow === 'boolean') out.has_glow = r.has_glow;
+      const glowColor = str(r.glow_color_hex);
+      if (glowColor) out.glow_color_hex = glowColor;
+      if (Number.isFinite(r.glow_radius as number)) out.glow_radius = r.glow_radius;
+      if (r.gradient && typeof r.gradient === 'object') out.gradient = r.gradient;
+      // color_runs(글자 중간 색변경)는 ref 에 있고 LLM 이 자체 runs 를 만들지 않았을 때만
+      // ref 색 시퀀스를 빌려온다 (렌더러가 grapheme 순서로 매핑하므로 텍스트가 달라도 색만 따라감).
+      if ((!Array.isArray(p.color_runs) || p.color_runs.length < 2)
+          && Array.isArray(r.color_runs) && r.color_runs.length >= 2) {
+        out.color_runs = r.color_runs;
+      }
+    }
+    // 글자 모양 힌트 — ref 의 폰트 인상을 따르도록 재주입 (색과 무관하므로 항상 적용).
     const ffh = str(r.font_family_hint); if (ffh) out.font_family_hint = ffh;
     const fw = str(r.font_width); if (fw) out.font_width = fw;
     const fwh = str(r.font_weight_hint); if (fwh) out.font_weight_hint = fwh;
-    // color_runs(글자 중간 색변경)는 ref 에 있고 LLM 이 자체 runs 를 만들지 않았을 때만
-    // ref 색 시퀀스를 빌려온다 (렌더러가 grapheme 순서로 매핑하므로 텍스트가 달라도 색만 따라감).
-    if ((!Array.isArray(p.color_runs) || p.color_runs.length < 2)
-        && Array.isArray(r.color_runs) && r.color_runs.length >= 2) {
-      out.color_runs = r.color_runs;
-    }
 
     // ── 위치 (형태 무관: 레이어 개수·텍스트 불변) ──
     const position = str(r.position);
@@ -1172,14 +1192,24 @@ function clamp01(n: number): number {
   return Math.max(0, Math.min(1, n));
 }
 
-// 한 컷 윈도우 결정. highlight 중심으로 ≤MAX_CUT_DUR 잘라낸다.
+// 한 컷 윈도우 결정.
+// 핵심: 컷 길이는 "매칭된 ref 컷의 길이"(targetDur)를 따라간다 → 레퍼런스의 템포/리듬 재현.
+// targetDur 를 [MIN_CUT_DUR, MAX_CUT_DUR] 로 클램프한 뒤, highlight 중심으로 그 길이만큼 잘라낸다.
+// (소스가 그보다 짧으면 더 만들 수 없으니 소스 전체를 쓴다.)
+// targetDur 미지정이면 예전 동작(≤MAX_CUT_DUR)으로 폴백.
 const MAX_CUT_DUR = 4.5;
-function pickWindow(s: SourceShot): { start: number; end: number } {
+const MIN_CUT_DUR = 0.6;   // 너무 짧은 컷(깜빡임) 방지 하한.
+function pickWindow(s: SourceShot, targetDur?: number): { start: number; end: number } {
   const segDur = Math.max(0.05, s.end - s.start);
-  if (segDur <= MAX_CUT_DUR) {
+  // 원하는 컷 길이: ref 컷 길이를 [MIN, MAX] 로 클램프. 미지정이면 기존 상한(MAX) 사용.
+  const desired = Number.isFinite(targetDur) && (targetDur as number) > 0
+    ? Math.max(MIN_CUT_DUR, Math.min(MAX_CUT_DUR, targetDur as number))
+    : MAX_CUT_DUR;
+  // 소스가 원하는 길이보다 짧으면 더 만들 수 없으니 소스 전체.
+  const useDur = Math.min(desired, segDur);
+  if (useDur >= segDur - 1e-3) {
     return { start: s.start, end: s.end };
   }
-  const useDur = MAX_CUT_DUR;
   const c = (s.highlight_start + s.highlight_end) / 2;
   let start = c - useDur / 2;
   let end = start + useDur;
