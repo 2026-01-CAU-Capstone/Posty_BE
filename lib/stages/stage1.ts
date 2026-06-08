@@ -681,6 +681,7 @@ export async function planCaptions(
   spec: any,
   extraFeedback?: string,
   groundingFrames?: MediaPart[],   // 각 cut 의 편집본 프레임(같은 순서/개수) — 있으면 멀티파트로 시각 그라운딩.
+  opts?: { regenerate?: boolean }, // 재생성 — 이전과 다른 문구가 나오도록 temperature 를 올린다.
 ): Promise<void> {
   if (!config.GEMINI_API_KEY) {
     fallbackToRefLayers(plan);
@@ -729,13 +730,15 @@ export async function planCaptions(
   });
 
   try {
-    // temperature 0.5: 창의적 변형 줄이고 지시(폰트 복사, 카테고리 유지 등) 충실하게.
+    // 기본 temperature 0.5: 창의적 변형 줄이고 지시(폰트 복사, 카테고리 유지 등) 충실하게.
+    // 재생성(regenerate): 같은 입력이면 거의 같은 자막이 나오므로 temperature 를 올려 문구를 바꾼다.
+    const temperature = opts?.regenerate ? 0.95 : 0.5;
     let parsed: any;
     if (grounded) {
-      const r = await analyzeMultiPartStructured(groundingFrames!, prompt, config.GEMINI_FLASH_MODEL);
+      const r = await analyzeMultiPartStructured(groundingFrames!, prompt, config.GEMINI_FLASH_MODEL, { temperature });
       parsed = r.parsed;
     } else {
-      const r = await callGeminiTextOnly(prompt, { temperature: 0.5, maxOutputTokens: 16384 });
+      const r = await callGeminiTextOnly(prompt, { temperature, maxOutputTokens: 16384 });
       parsed = r.parsed;
     }
     await appendRawResponse(projectId, {
