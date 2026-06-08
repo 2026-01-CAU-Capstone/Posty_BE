@@ -7,6 +7,8 @@
 // ============================================================
 
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 export type JobType = 'run_all' | 'stage';
 export type JobStatus = 'pending' | 'running' | 'done' | 'error';
@@ -45,6 +47,44 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+// ── 디스크 영속화 ────────────────────────────────────────────
+// 프로세스 재시작(tsx watch 리로드 등)에도 job 상태가 유지되도록 data/jobs.json 에 저장.
+// (이전엔 in-memory 휘발 → 재시작하면 프런트가 getJob 404 를 무한 폴링하며 진행이 멈췄음)
+const JOBS_FILE = path.join(process.cwd(), 'data', 'jobs.json');
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+function persistNow(): void {
+  if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+  try {
+    fs.mkdirSync(path.dirname(JOBS_FILE), { recursive: true });
+    const tmp = JOBS_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(Array.from(jobs.values())), 'utf8');
+    fs.renameSync(tmp, JOBS_FILE); // 원자적 교체 — 쓰는 도중 손상 방지
+  } catch { /* 영속화 실패는 비치명적 */ }
+}
+function persistSoon(): void {
+  if (persistTimer) return;
+  persistTimer = setTimeout(persistNow, 400);
+}
+// 시작 시 로드 — 중단된(running/pending) job 은 'error' 로 표시해
+// 프런트의 자동 재시도(마지막 완료 stage 다음부터 재실행)가 이어받게 한다.
+(function loadPersistedJobs(): void {
+  try {
+    if (!fs.existsSync(JOBS_FILE)) return;
+    const arr = JSON.parse(fs.readFileSync(JOBS_FILE, 'utf8'));
+    if (!Array.isArray(arr)) return;
+    for (const j of arr) {
+      if (!j || typeof j.id !== 'string') continue;
+      if (j.status === 'running' || j.status === 'pending') {
+        j.status = 'error';
+        j.error = '백엔드 재시작으로 작업이 중단됐어요. 자동으로 이어서 다시 시도합니다.';
+        j.finishedAt = j.finishedAt || nowIso();
+        j.updatedAt = nowIso();
+      }
+      jobs.set(j.id, j as Job);
+    }
+  } catch { /* 손상된 파일은 무시하고 새로 시작 */ }
+})();
+
 export function createJob(type: JobType, projectId: string, params: any): Job {
   const id = 'job_' + crypto.randomBytes(6).toString('hex');
   const job: Job = {
@@ -54,6 +94,7 @@ export function createJob(type: JobType, projectId: string, params: any): Job {
   };
   jobs.set(id, job);
   pendingQueue.push(id);
+  persistSoon();
   pump();
   return job;
 }
@@ -102,10 +143,12 @@ async function runOne(job: Job): Promise<void> {
   job.status = 'running';
   job.startedAt = nowIso();
   job.updatedAt = nowIso();
+  persistSoon();
 
   const progress: ProgressFn = (step, msg, extra) => {
     job.progress.push({ step, msg, at: nowIso(), extra });
     job.updatedAt = nowIso();
+    persistSoon();
   };
 
   try {
@@ -118,5 +161,6 @@ async function runOne(job: Job): Promise<void> {
   } finally {
     job.finishedAt = nowIso();
     job.updatedAt = nowIso();
+    persistNow(); // 완료/에러는 즉시 디스크 반영
   }
 }

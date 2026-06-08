@@ -9,13 +9,15 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { ARTIFACTS, appendRawResponse, readJson, readStyleNote, referenceDir, writeJson } from '../paths';
-import { analyzeVideoStructured } from '../gemini';
-import { probeDuration } from '../ffmpeg';
+import { ARTIFACTS, appendRawResponse, ensureDir, readJson, readStyleNote, referenceDir, workDir, writeJson } from '../paths';
+import { analyzeVideoStructured, analyzeMultiPartStructured } from '../gemini';
+import { probeDuration, extractFrame, cropRegion } from '../ffmpeg';
 import {
   REFERENCE_ANALYSIS_PROMPT,
   REFERENCE_TEXT_FOCUSED_PROMPT,
   buildReanalysisPrompt,
+  buildCaptionCropAnalysisPrompt,
+  buildCaptionLocalizePrompt,
   styleNoteBlock,
 } from '../prompts';
 import { clearStyleSuggest } from '../style-suggest';
@@ -37,6 +39,7 @@ export async function runStage0(
   shots: number;
   duration: number;
   text_focused_pass: 'ok' | 'failed' | 'skipped';
+  caption_crop_refine: 'ok' | 'failed' | 'skipped';
   reanalyzed: boolean;
 }> {
   const refDir = referenceDir(projectId);
@@ -108,6 +111,20 @@ export async function runStage0(
     textFocusedStatus = 'failed';
   }
 
+  // ---- 2.5차: 자막 크롭 정밀분석 (zoom-in) ----
+  // 자막의 세로 위치 기준 가로 밴드를 크롭·업스케일해 다시 LLM 에 보내, 색/박스/그림자/굵기를
+  // 풀프레임보다 정확히 읽고 caption_layers 의 스타일 필드만 덮어쓴다. (실패해도 분석은 유지)
+  let captionCropStatus: 'ok' | 'failed' | 'skipped' = 'skipped';
+  try {
+    const refined = await refineCaptionStylesViaCrops(projectId, spec, refFile);
+    captionCropStatus = refined > 0 ? 'ok' : 'skipped';
+  } catch (e: any) {
+    captionCropStatus = 'failed';
+    await appendRawResponse(projectId, {
+      stage: 0, kind: 'caption_crop_refine_failed', error: e.message || String(e),
+    });
+  }
+
   // ---- 워터마크/지속 오버레이 제거 ----
   // 출처/핸들/가게 워터마크처럼 "영상 콘텐츠가 아닌" 지속 오버레이를 spec 에서 미리 제거.
   // (caption planning 단계의 LLM 판단에만 맡기지 않고, 원천 차단)
@@ -125,7 +142,7 @@ export async function runStage0(
   // 첫 분석에선 사실상 noop 이지만, 재분석 시엔 stale 한 추천이 남는 걸 막아준다.
   await clearStyleSuggest(projectId);
 
-  return { ok: true, shots: spec.shots.length, duration: spec.duration, text_focused_pass: textFocusedStatus, reanalyzed };
+  return { ok: true, shots: spec.shots.length, duration: spec.duration, text_focused_pass: textFocusedStatus, caption_crop_refine: captionCropStatus, reanalyzed };
 }
 
 // ============================================================
@@ -304,21 +321,20 @@ function normalizeLayer(l: any): any | null {
 function mergeTextFocusedIntoSpec(spec: any, parsed2: any): void {
   if (!parsed2 || typeof parsed2 !== 'object') return;
 
-  // 1. caption_pattern 덮어쓰기 (텍스트 분석이 더 정확)
+  // 1. caption_pattern 머지 — OCR 은 텍스트 패턴(key_phrases 등)에 강하지만,
+  //    geometry 계열(size_contrast/position_variety/layer_count_typical/font_variety)은
+  //    시각 분석(main)이 더 정확하므로 main 값을 우선 보존한다.
   if (parsed2.caption_pattern && typeof parsed2.caption_pattern === 'object') {
-    spec.caption_pattern = {
-      ...spec.caption_pattern,
-      ...parsed2.caption_pattern,
-    };
+    spec.caption_pattern = mergeCaptionPattern(spec.caption_pattern, parsed2.caption_pattern);
   }
 
-  // 2. shots_text → shots[].caption_layers
+  // 2. shots_text → shots[].caption_layers (통째 덮어쓰기 금지, 스마트 머지)
   const shotsText = Array.isArray(parsed2.shots_text) ? parsed2.shots_text : [];
   if (shotsText.length === 0) return;
   if (!Array.isArray(spec.shots) || spec.shots.length === 0) return;
 
   for (const st of shotsText) {
-    const layers = Array.isArray(st?.layers)
+    const ocrLayers = Array.isArray(st?.layers)
       ? st.layers.map(normalizeLayer).filter((x: any) => x !== null)
       : [];
 
@@ -339,7 +355,331 @@ function mergeTextFocusedIntoSpec(spec: any, parsed2: any): void {
     }
     if (!target) continue;
 
-    // 덮어쓰기 — 빈 layers 도 의미 있음 (텍스트 없는 컷)
-    target.caption_layers = layers;
+    // 통째 덮어쓰기(X) → main 의 style/geometry/font/box 보존 + OCR text 보강 머지.
+    target.caption_layers = mergeShotLayers(target.caption_layers, ocrLayers);
   }
+}
+
+// caption_pattern 머지 — OCR 우선이되 geometry 계열은 main 보존.
+function mergeCaptionPattern(mainP: any, ocrP: any): any {
+  const m = (mainP && typeof mainP === 'object') ? mainP : {};
+  if (!ocrP || typeof ocrP !== 'object') return m;
+  const GEOMETRY_KEYS = ['size_contrast', 'position_variety', 'layer_count_typical', 'font_variety'];
+  const out: any = { ...m, ...ocrP };       // OCR base (텍스트 패턴 우선)
+  for (const k of GEOMETRY_KEYS) if (m[k] !== undefined) out[k] = m[k]; // geometry 는 main 우선
+  return out;
+}
+
+// 텍스트 유사도 (0~1) — 공백 제거 후 정확/포함/char-bigram Dice.
+function textSimilarity(a: string, b: string): number {
+  const na = String(a || '').replace(/\s+/g, '');
+  const nb = String(b || '').replace(/\s+/g, '');
+  if (!na && !nb) return 1;
+  if (!na || !nb) return 0;
+  if (na === nb) return 1;
+  if (na.includes(nb) || nb.includes(na)) return 0.85;
+  const bigrams = (s: string) => {
+    const g: string[] = [];
+    for (let i = 0; i < s.length - 1; i++) g.push(s.slice(i, i + 2));
+    return g.length ? g : [s];
+  };
+  const A = bigrams(na), B = bigrams(nb);
+  const counts = new Map<string, number>();
+  for (const x of B) counts.set(x, (counts.get(x) || 0) + 1);
+  let inter = 0;
+  for (const x of A) { const c = counts.get(x) || 0; if (c > 0) { inter++; counts.set(x, c - 1); } }
+  return (2 * inter) / (A.length + B.length);
+}
+
+// 위치 근접도 (0~1) — vertical_ratio(있으면) 또는 position.
+function layerPositionCloseness(a: any, b: any): number {
+  const va = Number(a?.vertical_ratio), vb = Number(b?.vertical_ratio);
+  if (Number.isFinite(va) && Number.isFinite(vb)) return Math.max(0, 1 - Math.abs(va - vb) * 2);
+  if (a?.position && b?.position) return a.position === b.position ? 1 : 0.4;
+  return 0.5;
+}
+
+// 한 shot 의 main(시각) layers + ocr(텍스트) layers 스마트 머지.
+//  - OCR 비면 main 보존(콘텐츠 hook 안 지움). main 비면 OCR 채택.
+//  - main↔ocr 를 text 유사도 + 위치 근접도로 매칭 → main style/geometry 유지, OCR text 채택,
+//    main 이 비운 style field 만 OCR 로 보강(= OCR 가 더 잘 잡은 경우).
+//  - 매칭 안 된 OCR text 는 main 이 놓친 것으로 보고 추가.
+export function mergeShotLayers(main: any, ocr: any): any[] {
+  const mainArr = Array.isArray(main) ? main : [];
+  const ocrArr = Array.isArray(ocr) ? ocr : [];
+  if (ocrArr.length === 0) return mainArr;   // OCR 텍스트 없음 → main 보존
+  if (mainArr.length === 0) return ocrArr;   // main 못 잡음 → OCR 채택
+
+  const usedOcr = new Set<number>();
+  const MATCH_THRESHOLD = 0.4;
+  const filled = (v: any) => String(v || '').trim().length > 0;
+
+  const out = mainArr.map((m: any) => {
+    let best = -1, bestScore = 0;
+    for (let j = 0; j < ocrArr.length; j++) {
+      if (usedOcr.has(j)) continue;
+      const score = textSimilarity(m.text, ocrArr[j].text) * 0.75 + layerPositionCloseness(m, ocrArr[j]) * 0.25;
+      if (score > bestScore) { bestScore = score; best = j; }
+    }
+    if (best < 0 || bestScore < MATCH_THRESHOLD) return m; // OCR 매치 없음 → main 그대로
+    usedOcr.add(best);
+    const o = ocrArr[best];
+    const merged = { ...m };
+    if (filled(o.text)) merged.text = o.text;                                   // OCR text 채택(한글 정확도)
+    if (!filled(m.color_hex) && filled(o.color_hex)) merged.color_hex = o.color_hex;             // main 빈 것만 보강
+    if (!filled(m.font_personality) && filled(o.font_personality)) merged.font_personality = o.font_personality;
+    if (!filled(m.font_family_hint) && filled(o.font_family_hint)) merged.font_family_hint = o.font_family_hint;
+    return merged;
+  });
+
+  // main 이 놓친 OCR-only text 추가
+  for (let j = 0; j < ocrArr.length; j++) {
+    if (!usedOcr.has(j) && filled(ocrArr[j].text)) out.push(ocrArr[j]);
+  }
+  return out;
+}
+
+// ============================================================
+// 자막 크롭 정밀분석 (zoom-in) — Stage 0 2.5차 패스
+// ----------------------------------------------------------------
+// 풀프레임 분석은 자막이 화면의 작은 일부라 색/박스/그림자/굵기를 자주 오판한다
+// (노란 글씨를 노란 박스로, 검은 외곽선을 검은 글씨로 등). 자막의 세로 위치 기준
+// 가로 밴드를 크롭·업스케일해 자막이 이미지를 꽉 채우게 한 뒤 다시 LLM 에 물어,
+// 스타일 필드(색/박스/그림자/외곽선/굵기/폰트)만 고신뢰로 덮어쓴다.
+//   · 같은 자막(텍스트+세로위치+크기)은 한 번만 분석하고 모든 등장 레이어에 적용(비용 절감).
+//   · 위치/크기/텍스트는 메인 분석 값을 유지(크롭은 절대 위치 정보를 잃으므로).
+// ============================================================
+
+type CropTarget = { si: number; li: number; vr: number; size: string; text: string };
+
+// 동시 크롭 상한 — 비용/페이로드 보호. 보통 고유 자막은 몇 개뿐이라 거의 안 걸린다.
+const MAX_CAPTION_CROPS = 40;
+
+// size_level → 크롭 밴드 높이 비율(프레임 높이 대비). 박스/그림자 가장자리가 안 잘리게 넉넉히.
+const CROP_BAND_FRAC: Record<string, number> = { huge: 0.34, large: 0.28, medium: 0.22, small: 0.18 };
+export function bandFracForSize(size?: string): number {
+  return CROP_BAND_FRAC[String(size || 'medium').toLowerCase()] ?? 0.24;
+}
+
+function positionToVr(position?: string): number {
+  const p = String(position || 'bottom').toLowerCase();
+  if (p === 'top') return 0.16;
+  if (p === 'center' || p === 'middle') return 0.5;
+  return 0.84;
+}
+
+// 같은 자막(텍스트 기준)을 한 그룹으로 묶는다. 대표(rep)는 첫 등장 레이어 = 자막이 실제로
+// 보일 가능성이 가장 높은 프레임. (반복 자막을 1회만 분석하고, 한 좋은 프레임으로 모든 등장에 적용)
+// vr/size 는 band 폴백용으로 rep 값을 보관하지만, 1차 위치는 LLM 로컬라이제이션으로 잡는다.
+export function groupCaptionsForCrop(spec: any): { key: string; rep: CropTarget; members: CropTarget[] }[] {
+  const groups = new Map<string, { rep: CropTarget; members: CropTarget[] }>();
+  const shots: any[] = Array.isArray(spec?.shots) ? spec.shots : [];
+  for (let si = 0; si < shots.length; si++) {
+    const layers: any[] = Array.isArray(shots[si]?.caption_layers) ? shots[si].caption_layers : [];
+    for (let li = 0; li < layers.length; li++) {
+      const l = layers[li];
+      const text = String(l?.text || '').trim();
+      if (!text) continue;
+      const vrRaw = Number(l?.vertical_ratio);
+      const vr = Number.isFinite(vrRaw) ? Math.max(0, Math.min(1, vrRaw)) : positionToVr(l?.position);
+      const size = String(l?.size_level || 'medium').toLowerCase();
+      const key = text.replace(/\s+/g, ' ').trim();   // 텍스트 기준 그룹핑
+      const t: CropTarget = { si, li, vr, size, text };
+      const g = groups.get(key);
+      if (g) g.members.push(t);
+      else groups.set(key, { rep: t, members: [t] });
+    }
+  }
+  return Array.from(groups.entries()).map(([key, v]) => ({ key, rep: v.rep, members: v.members }));
+}
+
+// 정규화 bbox.
+type Bbox = { x: number; y: number; w: number; h: number };
+
+// vr 밴드를 bbox 로 (가로 전체). 로컬라이제이션 실패 시 폴백.
+export function bandBox(vr: number, frac: number): Bbox {
+  const F = Math.max(0.05, Math.min(0.9, Number(frac) || 0.24));
+  const v = Math.max(0, Math.min(1, Number(vr) || 0.5));
+  return { x: 0, y: Math.max(0, Math.min(1 - F, v - F / 2)), w: 1, h: F };
+}
+
+// 로컬라이제이션 detections 중 기대 텍스트에 가장 잘 맞는 bbox 선택. 충분히 안 맞으면 null.
+export function pickDetectionBox(expected: string, detections: any[]): Bbox | null {
+  if (!Array.isArray(detections)) return null;
+  const norm = (v: number) => (v > 1.5 ? v / 100 : v);   // 퍼센트로 준 경우 보정
+  const c01 = (v: number) => Math.max(0, Math.min(1, v));
+  let best: Bbox | null = null;
+  let bestScore = 0;
+  for (const d of detections) {
+    const score = textSimilarity(expected, String(d?.text || ''));
+    const x = norm(Number(d?.x)), y = norm(Number(d?.y)), w = norm(Number(d?.w)), h = norm(Number(d?.h));
+    if (![x, y, w, h].every(Number.isFinite) || !(w > 0) || !(h > 0)) continue;
+    if (score > bestScore) {
+      best = { x: c01(x), y: c01(y), w: Math.min(1, w), h: Math.min(1, h) };
+      bestScore = score;
+    }
+  }
+  return bestScore >= 0.5 ? best : null;
+}
+
+// bbox 중심 → 정규화 세로/가로 위치. 레퍼런스 자막의 실제 위치를 그대로 복제하는 데 쓴다.
+export function bboxCenter(box: Bbox): { vr: number; hr: number } {
+  return {
+    vr: Math.max(0, Math.min(1, box.y + box.h / 2)),
+    hr: Math.max(0, Math.min(1, box.x + box.w / 2)),
+  };
+}
+
+// 안전장치: 크롭이 '기대한 자막'을 실제로 담았는지 검증.
+// 밴드가 자막을 빗나가면(분석 vertical_ratio 오차 등) LLM 이 엉뚱한 영역(예: 배경의 노란 봉지)을
+// 읽어 분석을 오히려 망칠 수 있다. 크롭이 되읽은 text 가 기대 text 와 충분히 유사할 때만 스타일을 적용한다.
+export function cropMatchesExpected(expected: string, got: string): boolean {
+  const g = String(got || '').trim();
+  if (!g) return false;
+  return textSimilarity(expected, g) >= 0.5;
+}
+
+// 크롭 분석 결과(스타일)를 레이어에 머지 — 값이 있을 때만 덮어쓴다. 텍스트/위치/크기는 건드리지 않는다.
+export function mergeCropStyleIntoLayer(layer: any, crop: any): void {
+  if (!layer || !crop || typeof crop !== 'object') return;
+  const str = (v: any) => (typeof v === 'string' && v.trim() ? v : undefined);
+  const num = (v: any) => (Number.isFinite(v) ? Number(v) : undefined);
+
+  if (str(crop.color_hex)) layer.color_hex = crop.color_hex;
+  if (Array.isArray(crop.color_runs) && crop.color_runs.length >= 2) layer.color_runs = crop.color_runs;
+  if (typeof crop.has_background_box === 'boolean') layer.has_background_box = crop.has_background_box;
+  if (str(crop.background_color_hex)) layer.background_color_hex = crop.background_color_hex;
+  if (num(crop.background_alpha) !== undefined) layer.background_alpha = crop.background_alpha;
+  if (typeof crop.has_shadow === 'boolean') layer.has_shadow = crop.has_shadow;
+  if (str(crop.shadow_color_hex)) layer.shadow_color_hex = crop.shadow_color_hex;
+  if (num(crop.shadow_blur) !== undefined) layer.shadow_blur = crop.shadow_blur;
+  if (typeof crop.has_glow === 'boolean') layer.has_glow = crop.has_glow;
+  if (str(crop.glow_color_hex)) layer.glow_color_hex = crop.glow_color_hex;
+  if (num(crop.glow_radius) !== undefined) layer.glow_radius = crop.glow_radius;
+  if (str(crop.outline_color_hex)) layer.outline_color_hex = crop.outline_color_hex;
+  if (str(crop.outline_thickness)) layer.outline_thickness = String(crop.outline_thickness).toLowerCase();
+  if (str(crop.emphasis)) layer.emphasis = String(crop.emphasis).toLowerCase();
+  if (str(crop.font_weight_hint)) layer.font_weight_hint = String(crop.font_weight_hint).toLowerCase();
+  if (str(crop.font_family_hint)) layer.font_family_hint = crop.font_family_hint;
+  if (str(crop.font_width)) layer.font_width = String(crop.font_width).toLowerCase();
+  if (str(crop.letter_spacing)) layer.letter_spacing = String(crop.letter_spacing).toLowerCase();
+}
+
+async function refineCaptionStylesViaCrops(projectId: string, spec: any, refFile: string): Promise<number> {
+  if (!config.GEMINI_API_KEY) return 0;
+  const groups = groupCaptionsForCrop(spec).slice(0, MAX_CAPTION_CROPS);
+  if (groups.length === 0) return 0;
+
+  const cropDir = path.join(workDir(projectId), '_caption_crops');
+  await ensureDir(cropDir);
+
+  // 대표 shot 프레임 추출(캐시). rep.si = 첫 등장 = 자막이 보일 가능성이 가장 높은 프레임.
+  const frameCache = new Map<number, string>();
+  const ensureFrame = async (si: number): Promise<string> => {
+    const cached = frameCache.get(si);
+    if (cached) return cached;
+    const shot = spec.shots?.[si] || {};
+    const mid = Math.max(0, ((Number(shot.start) || 0) + (Number(shot.end) || 1)) / 2);
+    const p = path.join(cropDir, `frame_${si}.jpg`);
+    await extractFrame(refFile, mid, p, 1280);
+    frameCache.set(si, p);
+    return p;
+  };
+
+  // ── Phase 1: 자막 위치 로컬라이제이션 (풀프레임 → bbox). vertical_ratio 오차에 강함. ──
+  const frameSis = Array.from(new Set(groups.map(g => g.rep.si)));
+  const siToFrameIdx = new Map<number, number>();
+  const frameParts: { filePath: string; mimeType: string }[] = [];
+  const frameHints: { idx: number; hints: string[] }[] = [];
+  for (let i = 0; i < frameSis.length; i++) {
+    const si = frameSis[i];
+    siToFrameIdx.set(si, i);
+    frameParts.push({ filePath: await ensureFrame(si), mimeType: 'image/jpeg' });
+    frameHints.push({ idx: i, hints: groups.filter(g => g.rep.si === si).map(g => g.rep.text) });
+  }
+  const frameDetections = new Map<number, any[]>();
+  try {
+    const r = await analyzeMultiPartStructured(frameParts, buildCaptionLocalizePrompt(frameHints), config.GEMINI_FLASH_MODEL);
+    for (const f of (Array.isArray(r.parsed?.frames) ? r.parsed.frames : [])) {
+      frameDetections.set(Number(f.idx), Array.isArray(f.captions) ? f.captions : []);
+    }
+    await appendRawResponse(projectId, { stage: 0, kind: 'caption_localize', frames: frameParts.length, response: r.raw });
+  } catch (e: any) {
+    // 로컬라이제이션 실패 → bbox 없이 vr-밴드 폴백으로 진행(게이트가 안전하게 거른다).
+    await appendRawResponse(projectId, { stage: 0, kind: 'caption_localize_failed', error: (e?.message || String(e)).slice(0, 300) });
+  }
+
+  // ── 각 그룹: bbox(로컬라이즈) 우선, 실패 시 vr-밴드 폴백으로 크롭 ──
+  const cropParts: { filePath: string; mimeType: string }[] = [];
+  const promptCrops: { idx: number; text: string; size_level?: string }[] = [];
+  const cropToGroup: number[] = [];
+  const groupDetBox: (Bbox | null)[] = [];
+  let localized = 0;
+  for (let gi = 0; gi < groups.length; gi++) {
+    const rep = groups[gi].rep;
+    const fp = await ensureFrame(rep.si);
+    const dets = frameDetections.get(siToFrameIdx.get(rep.si) ?? -1) || [];
+    const detBox = pickDetectionBox(rep.text, dets);
+    groupDetBox[gi] = detBox;
+    if (detBox) localized++;
+    const box = detBox || bandBox(rep.vr, bandFracForSize(rep.size));
+    const cropPath = path.join(cropDir, `crop_${gi}.jpg`);
+    await cropRegion(fp, cropPath, box.x, box.y, box.w, box.h, 0.04);
+    cropParts.push({ filePath: cropPath, mimeType: 'image/jpeg' });
+    promptCrops.push({ idx: cropParts.length - 1, text: rep.text, size_level: rep.size });
+    cropToGroup.push(gi);
+  }
+
+  // ── Phase 2: 크롭 정밀 스타일 분석 (확대 이미지 → 색/박스/그림자/굵기/폰트). Pro 우선. ──
+  let parsed: any;
+  try {
+    const r = await analyzeMultiPartStructured(cropParts, buildCaptionCropAnalysisPrompt(promptCrops), config.GEMINI_PRO_MODEL);
+    parsed = r.parsed;
+    await appendRawResponse(projectId, { stage: 0, kind: 'gemini_pro_caption_crop', crops: cropParts.length, localized, response: r.raw });
+  } catch (e: any) {
+    const r = await analyzeMultiPartStructured(cropParts, buildCaptionCropAnalysisPrompt(promptCrops), config.GEMINI_FLASH_MODEL);
+    parsed = r.parsed;
+    await appendRawResponse(projectId, { stage: 0, kind: 'gemini_flash_caption_crop_fallback', crops: cropParts.length, localized, fallback_reason: (e?.message || String(e)).slice(0, 300), response: r.raw });
+  }
+
+  const caps: any[] = Array.isArray(parsed?.captions) ? parsed.captions : [];
+  const byIdx = new Map<number, any>();
+  for (const c of caps) byIdx.set(Number(c.idx), c);
+
+  let applied = 0;
+  let skipped = 0;
+  for (let ci = 0; ci < cropToGroup.length; ci++) {
+    const crop = byIdx.get(ci);
+    const gi = cropToGroup[ci];
+    if (!crop) continue;
+    // 크롭이 기대 자막을 못 담았으면(빗나감) 적용하지 않는다 — 오판 주입 방지.
+    if (!cropMatchesExpected(groups[gi].rep.text, crop.text)) { skipped++; continue; }
+    // 로컬라이즈로 자막 위치를 찾았으면 그 bbox 중심을 vertical/horizontal_ratio 로 복제(정밀 위치).
+    // (폭/높이(box_w/h)는 더 이상 사용하지 않는다 — 사이징은 size_ratio, 줄 구조는 \n 존중이 담당.)
+    const detBox = groupDetBox[gi];
+    const pos = detBox ? bboxCenter(detBox) : null;
+    for (const m of groups[gi].members) {
+      const layer = spec.shots?.[m.si]?.caption_layers?.[m.li];
+      if (!layer) continue;
+      mergeCropStyleIntoLayer(layer, crop);
+      if (detBox && pos) {
+        layer.vertical_ratio = pos.vr;
+        layer.horizontal_ratio = pos.hr;
+      }
+      applied++;
+    }
+  }
+  if (skipped > 0) {
+    await appendRawResponse(projectId, {
+      stage: 0, kind: 'caption_crop_skipped', skipped_groups: skipped, applied_layers: applied,
+      note: '크롭이 기대 자막과 불일치(자막을 못 담음) → 해당 그룹 스타일 미적용',
+    });
+  }
+
+  // 전역 박스 플래그 정합화 — 어떤 레이어도 박스가 아니면 전역도 false.
+  if (spec.caption_global_style && typeof spec.caption_global_style === 'object') {
+    const anyBox = (spec.shots || []).some((s: any) => (s.caption_layers || []).some((l: any) => l?.has_background_box === true));
+    spec.caption_global_style.has_background_box = anyBox;
+  }
+  return applied;
 }

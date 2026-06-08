@@ -31,8 +31,8 @@ const MAX_CAPTION_CHARS = 60;
 const H_MARGIN = 48;
 const CAPTION_MAX_W = SCRIPT_W - H_MARGIN * 2;   // 984 — 좌우 마진 축소로 폭 예산 확대(기존 888). 한글 medium/large 가 바닥까지 안 깎이도록.
 const V_MARGIN = 130;
-const STACK_GAP_RATIO = 0.42;   // 인접 layer 간 수직 간격 = fontSize × 비율 (동적)
-const STACK_GAP_MIN = 28;
+const STACK_GAP_RATIO = 0.16;   // 인접 layer 간 수직 간격 = fontSize × 비율 (동적). 레퍼런스의 타이트한 제목 쌍처럼 가깝게.
+const STACK_GAP_MIN = 16;
 
 // 실제 SNS 자막 임팩트에 맞춰 사이즈 풀을 키운다.
 // 이전 풀: huge=132, large=104, medium=78, small=54
@@ -49,6 +49,9 @@ const MIN_SIZE_PT: Record<string, number> = { small: 50, medium: 62, large: 86, 
 // MIN_SCALEX 까지는 요청 크기를 유지한 채 가로만 압축, 그래도 안 되면 폰트 축소(+ 최후 FLOOR_SCALEX).
 const MIN_SCALEX = 80;
 const FLOOR_SCALEX = 70;
+// 한 줄 유지를 위해 허용하는 최소 가로압축(%). 레퍼런스 hook 이 한 줄이면 결과도 한 줄이 되도록,
+// 줄바꿈(2줄 쪼개기) 전에 폰트 축소 + \fscx 가로압축을 이 하한까지 먼저 시도한다.
+const SINGLE_LINE_MIN_SCALEX = 62;
 
 // 외곽선/그림자는 fontSize 에 비례시킨다 (px 고정 → 동적 비율).
 // 큰 자막에는 굵은 외곽선이, 작은 자막에는 얇은 외곽선이 자연스러움.
@@ -68,7 +71,8 @@ export type CaptionLayer = {
   vertical_ratio?: number;      // 0.0(맨 위)~1.0(맨 아래) — 정밀 세로 위치. 있으면 이걸 우선해 배치.
   horizontal_ratio?: number;    // 0.0(왼쪽 끝)~1.0(오른쪽 끝) — 정밀 가로 위치(텍스트 블록 중심). 있으면 좌표로 배치.
   horizontal_align?: string;    // left | center | right (블록 내 줄 정렬 / horizontal_ratio 없을 때의 가로 위치)
-  size_level?: string;          // small | medium | large | huge
+  size_level?: string;          // small | medium | large | huge (거친 4단계 폴백)
+  size_ratio?: number;          // 정밀 크기: 글자(한 줄) 높이 ÷ 영상 높이 (0~1). 있으면 버킷 대신 이 값으로 연속 사이징.
   color_hex?: string;
   // 한 자막 안에서 색이 중간에 바뀌는 경우(예: "오늘 [특가] 세일"에서 특가만 빨강).
   // runs 를 순서대로 이으면 text 와 같아야 한다. 색이 일정하면 비우거나 1개.
@@ -91,9 +95,15 @@ export type CaptionLayer = {
 
   has_background_box?: boolean;
   background_color_hex?: string;
+  background_alpha?: number;      // 0(완전 투명)~1(완전 불투명). 박스 배경 투명도.
   background_radius?: number;    // ASS 에선 무시 (사각 박스)
   background_padding?: number;
 
+  // 글자 모양 재현 힌트 (optional) — 번들 폰트 매핑 정확도를 높이기 위함.
+  font_family_hint?: string;     // 레퍼런스 폰트 이름 추정 (예: "Black Han Sans", "Pretendard"). 번들 family 와 매칭되면 우선.
+  font_width?: string;           // normal | condensed | expanded — 자폭 인상.
+  font_weight_hint?: string;     // thin | light | regular | medium | bold | black 등 굵기 인상.
+  font_style_notes?: string;     // 자유 서술 (예: "둥근 고딕, 약간 손글씨 느낌").
   gradient?: {
     type?: string;
     angle?: number;
@@ -122,6 +132,7 @@ export type GlobalCaptionStyle = {
   has_shadow?: boolean;
   has_background_box?: boolean;
   background_color_hex?: string;
+  background_alpha?: number;      // 0~1. 박스 배경 투명도 (layer 에 없을 때 폴백).
   size_level?: string;
 };
 
@@ -133,7 +144,7 @@ export type CutInput = {
   subjectCenterY?: number;
 };
 
-type Prepared = {
+export type Prepared = {
   layer: CaptionLayer;
   lines: string[];
   fontSize: number;
@@ -158,23 +169,21 @@ type Prepared = {
 export function buildCaptionAss(cuts: CutInput[], globalStyle: GlobalCaptionStyle | undefined): string {
   const g = globalStyle || {};
 
+  // 같은 자막이 연속 컷마다 떴다 사라지며 깜빡이는 걸 막는다 — 동일 자막의 인접 구간을 잇고
+  // 짧은 무자막 공백은 메워 하나의 연속 자막으로 만든다.
+  const mergedCuts = mergeCaptionRuns(cuts);
+
   const styleLines: string[] = [];
   const eventLines: string[] = [];
   let styleSeq = 0;
 
-  for (let ci = 0; ci < cuts.length; ci++) {
-    const cut = cuts[ci];
+  for (let ci = 0; ci < mergedCuts.length; ci++) {
+    const cut = mergedCuts[ci];
     if (!cut || !Array.isArray(cut.layers) || cut.layers.length === 0) continue;
     if (!Number.isFinite(cut.start) || !Number.isFinite(cut.end) || cut.end <= cut.start) continue;
 
-    const sanitized = cut.layers
-      .map(l => sanitizeLayer(l, g))
-      .filter((l): l is CaptionLayer => l !== null);
-    if (sanitized.length === 0) continue;
-
-    const prepared = sanitized.map(l => prepareLayer(l, g));
-    applySubjectAwarePosition(prepared, cut.subjectCenterY);
-    placeLayers(prepared);
+    const prepared = layoutCut(cut.layers, g, cut.subjectCenterY);
+    if (prepared.length === 0) continue;
 
     const dur = cut.end - cut.start;
     for (const p of prepared) {
@@ -185,6 +194,59 @@ export function buildCaptionAss(cuts: CutInput[], globalStyle: GlobalCaptionStyl
   }
 
   return assDocument(styleLines, eventLines);
+}
+
+// ============================================================
+// 같은 자막의 인접 구간 합치기 (깜빡임 제거)
+// ----------------------------------------------------------------
+// 동일한 자막(텍스트+색+세로위치)이 여러 연속 컷에 걸쳐 있으면, 컷 경계마다 끊겨
+// "떴다 사라졌다" 반복하는 조잡함이 생긴다. 시간상 인접하고 내용이 같은 구간을 하나로
+// 잇고, 그 사이의 짧은 무자막 공백(BRIDGE_SEC 이하)은 메워 연속 자막으로 만든다.
+// (다른 자막이거나 공백이 길면 합치지 않는다.)
+// ============================================================
+const CAPTION_BRIDGE_SEC = 2.5;
+
+function captionRunSig(layers: CaptionLayer[]): string {
+  return (Array.isArray(layers) ? layers : [])
+    .map(l => `${String(l.text || '').trim()}|${normHex(l.color_hex)}|${Math.round((Number(l.vertical_ratio) || 0) * 20)}`)
+    .join('||');
+}
+
+export function mergeCaptionRuns(cuts: CutInput[], bridgeSec = CAPTION_BRIDGE_SEC): CutInput[] {
+  const valid = (Array.isArray(cuts) ? cuts : [])
+    .filter(c => c && Array.isArray(c.layers) && c.layers.length > 0
+      && Number.isFinite(c.start) && Number.isFinite(c.end) && c.end > c.start)
+    .sort((a, b) => a.start - b.start);
+  const out: CutInput[] = [];
+  for (const c of valid) {
+    const prev = out[out.length - 1];
+    if (prev && captionRunSig(prev.layers) === captionRunSig(c.layers) && c.start - prev.end <= bridgeSec) {
+      prev.end = Math.max(prev.end, c.end);     // 같은 자막 연속/짧은 공백 → 이어붙임
+    } else {
+      out.push({ ...c });
+    }
+  }
+  return out;
+}
+
+// ============================================================
+// 한 컷의 레이어들을 sanitize → prepare → 배치까지 수행해 Prepared[] 반환.
+// (buildCaptionAss 의 컷 단위 로직을 분리 — 레이아웃 단위 테스트 가능.)
+// ============================================================
+export function layoutCut(
+  layers: CaptionLayer[],
+  globalStyle?: GlobalCaptionStyle,
+  subjectCenterY?: number,
+): Prepared[] {
+  const g = globalStyle || {};
+  const sanitized = (Array.isArray(layers) ? layers : [])
+    .map(l => sanitizeLayer(l, g))
+    .filter((l): l is CaptionLayer => l !== null);
+  if (sanitized.length === 0) return [];
+  const prepared = sanitized.map(l => prepareLayer(l, g));
+  applySubjectAwarePosition(prepared, subjectCenterY);
+  placeLayers(prepared);
+  return prepared;
 }
 
 function assDocument(styleLines: string[], eventLines: string[]): string {
@@ -241,6 +303,8 @@ export function preserveLayerDesign(raw: any): Partial<CaptionLayer> {
   if (raw.has_background_box === true || raw.has_background_box === false) out.has_background_box = raw.has_background_box === true;
   const boxColor = str(raw.background_color_hex);
   if (boxColor) out.background_color_hex = boxColor;
+  // 박스 투명도 (0~1) — 보존해 반투명 박스를 렌더까지 전달.
+  if (num(raw.background_alpha) !== undefined) out.background_alpha = clamp01(Number(raw.background_alpha));
   if (num(raw.background_radius) !== undefined) out.background_radius = Number(raw.background_radius);
   if (num(raw.background_padding) !== undefined) out.background_padding = Number(raw.background_padding);
 
@@ -255,6 +319,20 @@ export function preserveLayerDesign(raw: any): Partial<CaptionLayer> {
   if (ls) out.letter_spacing = ls.toLowerCase();
   const ea = str(raw.entry_animation);
   if (ea) out.entry_animation = ea.toLowerCase();
+
+  // 글자 모양 재현 힌트 — 있을 때만 보존 (번들 폰트 매핑에 활용).
+  const ffh = str(raw.font_family_hint);
+  if (ffh) out.font_family_hint = ffh;
+  const fw = str(raw.font_width);
+  if (fw) out.font_width = fw.toLowerCase();
+  const fwh = str(raw.font_weight_hint);
+  if (fwh) out.font_weight_hint = fwh.toLowerCase();
+  const fsn = str(raw.font_style_notes);
+  if (fsn) out.font_style_notes = fsn;
+
+  // 정밀 글자 크기 (글자 높이 ÷ 영상 높이, 0~1) — 있으면 렌더가 4단계 버킷 대신 이 비율로 사이징.
+  const sr = Number(raw.size_ratio);
+  if (Number.isFinite(sr) && sr > 0 && sr <= 0.5) out.size_ratio = sr;
 
   // 정밀 세로 위치 (0~1) — 있으면 보존해 렌더가 고정 마진 대신 이 비율로 배치.
   const vr = Number(raw.vertical_ratio);
@@ -299,6 +377,10 @@ export function sanitizeLayer(raw: any, global: GlobalCaptionStyle): CaptionLaye
     position: String(raw.position || 'bottom').toLowerCase(),
     horizontal_align: String(raw.horizontal_align || 'center').toLowerCase(),
     size_level: String(raw.size_level || global.size_level || 'medium').toLowerCase(),
+    // 정밀 크기 (글자 높이÷영상 높이) — 있으면 prepareLayer 가 4단계 버킷 대신 이 값으로 사이징.
+    // (유효 범위 밖이면 undefined 로 두어 버킷 폴백.)
+    size_ratio: (Number.isFinite(raw.size_ratio) && Number(raw.size_ratio) > 0 && Number(raw.size_ratio) <= 0.5)
+      ? Number(raw.size_ratio) : undefined,
     color_hex: normHex(raw.color_hex || global.primary_color_hex || '#FFFFFF'),
     emphasis: String(raw.emphasis || global.font_weight || 'bold').toLowerCase(),
     italic: raw.italic === true || (raw.italic === undefined && global.font_italic === true),
@@ -318,11 +400,21 @@ export function sanitizeLayer(raw: any, global: GlobalCaptionStyle): CaptionLaye
     shadow_offset_y: Number.isFinite(raw.shadow_offset_y) ? Number(raw.shadow_offset_y) : 4,
     shadow_blur: Number.isFinite(raw.shadow_blur) ? Number(raw.shadow_blur) : 6,
 
-    has_background_box: raw.has_background_box === true
-      || (raw.has_background_box === undefined && global.has_background_box === true),
+    // 박스는 레이어가 명시적으로 has_background_box=true 라고 할 때만. (전역값 자동 상속 제거)
+    // 레퍼런스가 박스 없이 그림자/글로우만 있는데 caption_global_style.has_background_box 가 한 번
+    // 오판되면 박스 미지정 레이어 전부에 검은 판이 씌워지던 문제를 차단 — 레퍼런스 형식 충실도 ↑.
+    has_background_box: raw.has_background_box === true,
     background_color_hex: normHex(raw.background_color_hex || global.background_color_hex || '#000000'),
+    // 박스 투명도: layer 값 우선, 없으면 global, 그것도 없으면 불투명(1).
+    background_alpha: Number.isFinite(raw.background_alpha) ? clamp01(Number(raw.background_alpha))
+      : (Number.isFinite(global.background_alpha) ? clamp01(Number(global.background_alpha)) : 1),
     background_radius: Number.isFinite(raw.background_radius) ? Number(raw.background_radius) : 14,
     background_padding: Number.isFinite(raw.background_padding) ? Number(raw.background_padding) : 28,
+
+    // 글자 모양 힌트 — 폰트 선택에 활용 (있을 때만).
+    font_family_hint: raw.font_family_hint ? String(raw.font_family_hint) : undefined,
+    font_width: raw.font_width ? String(raw.font_width).toLowerCase() : undefined,
+    font_weight_hint: raw.font_weight_hint ? String(raw.font_weight_hint).toLowerCase() : undefined,
 
     gradient: normalizeGradient(raw.gradient),
 
@@ -333,6 +425,11 @@ export function sanitizeLayer(raw: any, global: GlobalCaptionStyle): CaptionLaye
     letter_spacing: String(raw.letter_spacing || 'normal').toLowerCase(),
     entry_animation: String(raw.entry_animation || 'none').toLowerCase(),
   };
+
+  // 유채색 박스 오판 보정 — '색 글씨'를 '색 박스'로 뒤집어 읽은 분석 결과를 되돌린다.
+  // (예: 검은글씨+노란박스 → 노란글씨+검은외곽선, 박스 제거). 아래 가독성 보강보다 먼저 실행해
+  // 박스가 풀린 레이어가 외곽선/그림자 보강을 받도록 한다.
+  correctVividBoxMisread(out);
 
   // ----------------------------------------------------------------
   // 가독성 — "구조"만 보장하고 "색"은 강제하지 않는다 (다양한 색 표현 허용).
@@ -384,19 +481,32 @@ function prepareLayer(layer: CaptionLayer, global: GlobalCaptionStyle): Prepared
   //   3) 너비가 안 맞으면 폰트를 깎기 전에 \fscx(가로압축)로 먼저 맞춰 요청 크기를 유지
   //      (그래도 안 되면 줄수 2→3 → 폰트 축소 순. ref 의 "large" 가 결과에서 바닥으로 안 떨어지게)
   // ─────────────────────────────────────────────────────
+  // 정밀 size_ratio(글자 높이 ÷ 영상 높이) 가 있으면 그걸로 연속 px 사이징.
+  // 없으면 LLM 의 4단계 size_level → (모르면) 글자수 기반 autoSizeLevel 폴백.
+  // 정밀 px 가 있을 땐 minSize/floor 경계가 일관되도록 sizeLevel 도 px 에서 파생한다.
+  const precisePx = sizeRatioToPx(layer.size_ratio);
   const llmLevel = String(layer.size_level || '').toLowerCase();
-  const sizeLevel = (llmLevel in SIZE_PT) ? llmLevel : autoSizeLevel(truncated);
-  const requested = SIZE_PT[sizeLevel] ?? SIZE_PT.medium;
+  const bucketLevel = (llmLevel in SIZE_PT) ? llmLevel : autoSizeLevel(truncated);
+  const sizeLevel = precisePx !== undefined ? bucketForSizePx(precisePx) : bucketLevel;
+  const requested = precisePx ?? (SIZE_PT[sizeLevel] ?? SIZE_PT.medium);
   const fit = fitCaptionForFrame(truncated, requested, sizeLevel);
 
   const fontFamily = pickBundledFont({
     category: layer.font_category,
     personality: layer.font_personality,
     emphasis: layer.emphasis,
+    familyHint: layer.font_family_hint,
+    weightHint: layer.font_weight_hint,
   });
   const bold = layer.emphasis === 'bold' || layer.emphasis === 'black';
   const italic = layer.italic === true;
   const spacingPx = Math.round((LETTER_SPACING_EM[layer.letter_spacing || 'normal'] ?? 0) * fit.fontSize);
+
+  // condensed(좁은 자폭) — 번들에 진짜 condensed 한글 폰트가 없으므로 \fscx 가로압축으로 근사.
+  // (fit 이 이미 압축했으면 더 좁은 쪽 유지.)
+  const condensed = String(layer.font_width || '').toLowerCase() === 'condensed'
+    || String(layer.font_category || '').toLowerCase() === 'condensed';
+  const scaleX = condensed ? Math.min(fit.scaleX, 86) : fit.scaleX;
 
   const lineHeight = Math.ceil(fit.fontSize * 1.32);
   let blockH = lineHeight * fit.lines.length;
@@ -408,13 +518,13 @@ function prepareLayer(layer: CaptionLayer, global: GlobalCaptionStyle): Prepared
 
   // 블록 가로 폭 — 가로 좌표(horizontal_ratio) 배치 시 화면 밖으로 안 나가게 클램프하는 데 쓴다.
   const widest = fit.lines.reduce((m, l) => Math.max(m, measureTextWidth(l, fit.fontSize)), 1);
-  const blockW = widest * (fit.scaleX / 100);
+  const blockW = widest * (scaleX / 100);
 
   return {
     layer,
     lines: fit.lines,
     fontSize: fit.fontSize,
-    scaleX: fit.scaleX,
+    scaleX,
     fontFamily,
     bold,
     italic,
@@ -535,6 +645,10 @@ function placeLayers(items: Prepared[]): void {
     p.y = Math.round(p.y);
   }
 
+  // 레이어 수직 충돌 해소 — bbox 가 겹치는(또는 최소 gap 미만) 레이어들을 ref 순서 유지한 채 분리.
+  // (vertical_ratio 좌표 배치 레이어끼리도 적용. 긴 텍스트로 blockH 가 커진 경우도 처리.)
+  resolveVerticalOverlaps(items);
+
   // 가로 안전 마진 — anchor 열에 맞춰 블록이 화면 밖으로 안 나가게.
   const safeLeft = H_MARGIN;
   const safeRight = SCRIPT_W - H_MARGIN;
@@ -555,6 +669,69 @@ function placeLayers(items: Prepared[]): void {
     }
     p.x = Math.round(p.x);
   }
+}
+
+// ============================================================
+// 레이어 bbox(세로 범위) — anchor 종류에 따라 y 기준이 다르다.
+// ============================================================
+export function layerBBox(p: Prepared): { top: number; bottom: number } {
+  const a = p.anchor;
+  if (a >= 7) return { top: p.y, bottom: p.y + p.blockH };           // top anchor: y=상단
+  if (a <= 3) return { top: p.y - p.blockH, bottom: p.y };           // bottom anchor: y=하단
+  return { top: p.y - p.blockH / 2, bottom: p.y + p.blockH / 2 };    // middle anchor: y=중심
+}
+
+function setBBoxTop(p: Prepared, top: number): void {
+  const a = p.anchor;
+  if (a >= 7) p.y = Math.round(top);                  // top anchor
+  else if (a <= 3) p.y = Math.round(top + p.blockH);  // bottom anchor
+  else p.y = Math.round(top + p.blockH / 2);          // middle anchor
+}
+
+// ============================================================
+// 레이어 수직 충돌 해소 (순수 함수 — 테스트 가능).
+//  - bbox 가 겹치거나 최소 gap(fontSize 비례) 미만이면 ref 상대순서를 유지한 채 위/아래로 분리.
+//  - 분리 후 그룹을 원래 중심 부근으로 되돌리고, safe area 안으로 클램프.
+//  - vertical_ratio 좌표 배치 레이어끼리도 적용된다(같은 caption group 으로 간주).
+//  - 긴 텍스트로 blockH 가 커져도 겹치지 않는다(스택이 화면보다 크면 최선으로 클램프).
+// ============================================================
+export function resolveVerticalOverlaps(items: Prepared[]): void {
+  if (!Array.isArray(items) || items.length < 2) return;
+
+  const safeTop = Math.round(V_MARGIN / 2);
+  const safeBottom = SCRIPT_H - Math.round(V_MARGIN / 2);
+  const gapOf = (a: Prepared, b: Prepared) =>
+    Math.max(STACK_GAP_MIN, Math.round(((a.fontSize + b.fontSize) / 2) * STACK_GAP_RATIO));
+
+  // ref 상대 순서 = 현재 bbox 중심 y 오름차순 (동률이면 원래 인덱스 유지).
+  const order = items
+    .map((p, i) => { const b = layerBBox(p); return { p, i, c: (b.top + b.bottom) / 2 }; })
+    .sort((a, b) => (a.c - b.c) || (a.i - b.i));
+
+  // 겹침/gap부족이 없으면 변경하지 않음(ref 위치 보존).
+  let needs = false;
+  for (let k = 1; k < order.length; k++) {
+    const minTop = layerBBox(order[k - 1].p).bottom + gapOf(order[k - 1].p, order[k].p);
+    if (layerBBox(order[k].p).top < minTop - 0.5) { needs = true; break; }
+  }
+  if (!needs) return;
+
+  const seq = order.map(o => o.p);
+  const origCenter = order.reduce((s, o) => s + o.c, 0) / order.length;
+
+  // 1) 위→아래로 최소 gap 확보하며 밀어내기.
+  for (let k = 1; k < seq.length; k++) {
+    const minTop = layerBBox(seq[k - 1]).bottom + gapOf(seq[k - 1], seq[k]);
+    if (layerBBox(seq[k]).top < minTop) setBBoxTop(seq[k], minTop);
+  }
+
+  // 2) 해소된 스택을 원래 중심 부근으로 재배치 + safe area 클램프.
+  const stackTop = layerBBox(seq[0]).top;
+  const stackBottom = layerBBox(seq[seq.length - 1]).bottom;
+  let shift = origCenter - (stackTop + stackBottom) / 2;
+  if (stackBottom + shift > safeBottom) shift = safeBottom - stackBottom; // 아래 넘침 방지
+  if (stackTop + shift < safeTop) shift = safeTop - stackTop;             // 위 넘침 방지(우선)
+  if (Math.abs(shift) > 0.5) for (const p of seq) setBBoxTop(p, layerBBox(p).top + shift);
 }
 
 function anchorCode(position: 'top' | 'center' | 'bottom', hAlign: 'left' | 'center' | 'right'): number {
@@ -588,7 +765,8 @@ function buildStyleLine(name: string, p: Prepared): string {
 
   if (layer.has_background_box) {
     borderStyle = 3;
-    outlineColour = hexToAss(layer.background_color_hex || '#000000');
+    // 박스 배경색 + 투명도(background_alpha). alpha=0.5 면 반투명 박스, 1 이면 불투명.
+    outlineColour = hexToAss(layer.background_color_hex || '#000000', layer.background_alpha);
     // 박스 padding 도 fontSize 비례 (LLM 이 명시 안 하면 자동).
     const pad = Number.isFinite(layer.background_padding)
       ? Math.round(layer.background_padding as number)
@@ -670,6 +848,14 @@ function buildDialogueLine(styleName: string, p: Prepared, start: number, end: n
     const dy = Math.round(layer.shadow_offset_y ?? 4);
     if (dx !== 0) tags.push(`\\xshad${dx}`);
     if (dy !== 0) tags.push(`\\yshad${dy}`);
+    // 부드러운 그림자/헤일로 — shadow_blur 가 있으면 \blur 로 외곽·그림자를 흐린다.
+    // (레퍼런스처럼 "글자 획 주변만 어둡게 퍼지는" 룩을 박스 없이 재현. 이전엔 shadow_blur 가
+    //  파싱·보존만 되고 렌더에서 완전히 무시됐다.) 박스가 있으면 무의미, 글로우가 이미 \blur 를
+    //  넣는 경우는 중복을 피한다.
+    if (!layer.has_background_box && !layer.has_glow) {
+      const sb = Number(layer.shadow_blur);
+      if (Number.isFinite(sb) && sb > 0) tags.push(`\\blur${clampNum(Math.round(sb), 1, 24)}`);
+    }
   }
 
   // 글로우 근사 — 외곽선을 부드럽게 blur (fontSize 비례)
@@ -752,13 +938,19 @@ function resolvePrimary(layer: CaptionLayer): string {
   return layer.color_hex || '#FFFFFF';
 }
 
-// #RRGGBB → ASS &HAABBGGRR (AA=00 불투명, BGR 순서)
-function hexToAss(hex?: string): string {
+// #RRGGBB → ASS &HAABBGGRR (BGR 순서). alpha(0~1, 1=불투명) 를 주면 AA 에 반영.
+// ASS alpha 규약: AA=00 불투명, FF 완전투명 → AA = round((1-alpha)*255). alpha 미지정이면 불투명(00).
+function hexToAss(hex?: string, alpha?: number): string {
   const h = normHex(hex).replace('#', '');
   const r = h.slice(0, 2);
   const g = h.slice(2, 4);
   const b = h.slice(4, 6);
-  return `&H00${b}${g}${r}`.toUpperCase();
+  let aa = '00';
+  if (Number.isFinite(alpha as number)) {
+    const a = Math.max(0, Math.min(255, Math.round((1 - (alpha as number)) * 255)));
+    aa = a.toString(16).padStart(2, '0');
+  }
+  return `&H${aa}${b}${g}${r}`.toUpperCase();
 }
 
 function normHex(hex?: string): string {
@@ -779,6 +971,55 @@ function colorsNearlyIdentical(a?: string, b?: string): boolean {
 
 function pickReadableOutline(textHex?: string): string {
   return lumaOf(textHex) > 0.55 ? '#000000' : '#FFFFFF';
+}
+
+// 고채도 유채색인가 — 검정/흰/회색/어두운 반투명 같은 '진짜 배경판' 색과 구분하기 위한 신호.
+// (한국형 임팩트 자막의 노랑/빨강/초록 '색 글씨'를 박스로 오판했는지 가리는 데 쓴다.)
+function isVividChroma(hex?: string): boolean {
+  const h = normHex(hex).replace('#', '');
+  const r = parseInt(h.slice(0, 2), 16) || 0;
+  const g = parseInt(h.slice(2, 4), 16) || 0;
+  const b = parseInt(h.slice(4, 6), 16) || 0;
+  const chroma = (Math.max(r, g, b) - Math.min(r, g, b)) / 255; // 0(무채색)~1(순색)
+  const lum = lumaOf(hex);
+  return chroma >= 0.45 && lum > 0.12 && lum < 0.95;
+}
+
+// ============================================================
+// '색 글씨'를 '색 박스'로 뒤집어 읽은 분석 오판을 렌더 직전 결정적으로 되돌린다.
+//
+// 배경: 한국형 임팩트 자막은 '유채색 굵은 글씨 + 어두운 외곽선/그림자'가 매우 흔한데,
+// 분석 LLM 은 이를 자주 '유채색 박스 + (검정/흰) 글씨'로 뒤집어 읽는다.
+//   예) 노란 "기린이찌방 한강점"(검은 외곽선) → color=#000000 + box=#FFE600 (검은 글씨+노란 박스)
+// 진짜 배경판은 보통 검정/흰/회색/어두운 반투명이라, '유채색 불투명 박스'는 거의 항상 오판이다.
+// 프롬프트 경고만으론 못 막아(LLM 이 계속 틀림) 여기서 결정적으로 교정한다.
+// ============================================================
+function correctVividBoxMisread(out: CaptionLayer): void {
+  if (out.has_background_box !== true) return;
+  const box = out.background_color_hex || '';
+  if (!isVividChroma(box)) return;                    // 검정/흰/회색/어두운 박스는 진짜 → 보존
+  const textLum = lumaOf(out.color_hex);
+
+  if (colorsNearlyIdentical(out.color_hex, box)) {
+    // 글자색 ≈ 박스색 (노란 글씨를 노란 박스로): 색 글씨다.
+    out.color_hex = box;
+    out.has_background_box = false;
+    out.background_color_hex = '';
+  } else if (textLum < 0.2) {
+    // 유채색 글씨 + 검은 외곽선을 '검은 글씨 + 유채색 박스'로 뒤집어 읽음.
+    // → 유채색을 글자색으로 되돌리고, 검정은 외곽선으로.
+    out.color_hex = box;
+    out.has_background_box = false;
+    out.background_color_hex = '';
+    out.outline_color_hex = '#000000';
+    const ot = String(out.outline_thickness || '').toLowerCase();
+    if (ot === 'none' || ot === '') out.outline_thickness = 'medium';
+  } else if (lumaOf(box) > 0.6 && textLum > 0.6) {
+    // 밝은 유채색 '박스' + 밝은(흰) 글씨 = 대비 모순 → 인접 색글씨의 번짐을 박스로 오판한 것.
+    // 박스만 해제하고 글자색(흰색 등)은 유지.
+    out.has_background_box = false;
+    out.background_color_hex = '';
+  }
 }
 
 function lumaOf(hex?: string): number {
@@ -816,6 +1057,25 @@ function autoSizeLevel(text: string): string {
   return 'small';
 }
 
+// 정밀 글자 크기: size_ratio(글자 높이 ÷ 영상 높이) → ASS Fontsize(px).
+// SIZE_PT 버킷과 동일 스케일(px = ratio × SCRIPT_H)이라 버킷 폴백과 자연스럽게 호환된다.
+// (small≈0.033 / medium≈0.05 / large≈0.073 / huge≈0.104 부근.)
+// 비정상/누락 값은 undefined 반환 → 호출부가 4단계 버킷으로 폴백.
+function sizeRatioToPx(ratio?: number): number | undefined {
+  if (!Number.isFinite(ratio as number)) return undefined;
+  const r = Number(ratio);
+  if (r <= 0.005 || r > 0.5) return undefined;          // 너무 작거나 큰 값은 신뢰하지 않음
+  return clampNum(Math.round(r * SCRIPT_H), 44, 240);   // small 하한 ~ huge 상한 근처로 클램프
+}
+
+// 정밀 px → 가장 가까운 4단계 버킷. minSize/floor 경계 + 폰트 선택 일관성을 위해 사용.
+function bucketForSizePx(px: number): string {
+  if (px < 80) return 'small';
+  if (px < 118) return 'medium';
+  if (px < 170) return 'large';
+  return 'huge';
+}
+
 function truncate(s: string): string {
   const t = s.trim();
   const chars = graphemes(t);
@@ -837,6 +1097,43 @@ function fitCaptionForFrame(
   sizeLevel: string,
 ): { lines: string[]; fontSize: number; scaleX: number } {
   const minSize = MIN_SIZE_PT[sizeLevel] ?? 60;
+
+  // ─────────────────────────────────────────────────────
+  // 0) 명시적 줄바꿈(\n) 존중 — LLM/레퍼런스가 텍스트에 줄바꿈을 넣었으면 그게 "의도한 줄 구조".
+  //   너비 기준으로 다시 wrap 하면 의도와 다른 위치/줄수로 쪼개져 형태가 깨진다
+  //   (예: "노을 보며 마시는\n시원한 기린 생맥주" → 엉뚱하게 3줄). 그 줄 구조를 그대로 두고
+  //   폰트 축소 + \fscx 가로압축으로만 폭에 맞춘다(재wrap 없음).
+  //   한 줄에 \n 이 없으면(또는 1줄로 줄면) 아래 기존 로직으로 진행.
+  // ─────────────────────────────────────────────────────
+  if (/[\r\n]/.test(text)) {
+    const explicit = text.split(/\r?\n/).map(s => s.replace(/\s+/g, ' ').trim()).filter(Boolean);
+    if (explicit.length >= 2) return fitFixedLines(explicit, requestedSize, minSize);
+    if (explicit.length === 1) text = explicit[0]; // 후행 개행 등 — 단일 줄로 정리 후 기존 로직
+  }
+
+  // ─────────────────────────────────────────────────────
+  // A0) 한 줄 유지 우선 (큰 hook 자막 한정: huge/large).
+  //   레퍼런스의 임팩트 자막은 보통 "한 줄"이다. 그런데 기존 로직은 1줄 레이아웃을 아예
+  //   시도하지 않고 곧장 2줄로 wrap 해서, "기린이찌방 한강점" 같은 한 덩어리가 2줄로
+  //   쪼개져 답답해 보였다. → 줄바꿈 전에, 요청 크기에서 폰트만 단계적으로 줄이며
+  //   \fscx 가로압축(하한 SINGLE_LINE_MIN_SCALEX)으로 한 줄에 맞춰본다. 맞으면 가장 큰
+  //   크기를 채택하고 한 줄을 유지. 끝내 한 줄로 못 담으면 아래 다줄 로직으로 폴백.
+  //   (medium/small 본문 자막은 2줄이 자연스러우므로 이 단계 제외 — 과도한 폰트 축소 방지.)
+  // ─────────────────────────────────────────────────────
+  if (sizeLevel === 'huge' || sizeLevel === 'large') {
+    const oneLine = text.replace(/\s+/g, ' ').trim();
+    if (oneLine) {
+      for (let size = requestedSize; size >= minSize; size -= 6) {
+        const w = measureTextWidth(oneLine, size);
+        if (w <= CAPTION_MAX_W) return { lines: [oneLine], fontSize: size, scaleX: 100 };
+        const scaleX = Math.floor((CAPTION_MAX_W / w) * 100);
+        if (scaleX >= SINGLE_LINE_MIN_SCALEX) {
+          return { lines: [oneLine], fontSize: size, scaleX: clampNum(scaleX, SINGLE_LINE_MIN_SCALEX, 100) };
+        }
+      }
+    }
+  }
+
   // 긴 한글 캡션은 2줄로 안 떨어져 폰트가 깎이던 주범 → 길면 3줄까지 허용(줄바꿈만, 형태 불변).
   const nonSpaceLen = graphemes(text).filter(g => !/\s/.test(g)).length;
   const lineOptions = nonSpaceLen > 12 ? [2, 3] : [2];
@@ -865,6 +1162,25 @@ function fitCaptionForFrame(
 
   // C) 최후 — minSize + 가능한 최대 압축.
   const lines = wrapLinesNoTrunc(text, minSize, maxLines);
+  const widest = maxLineWidth(lines, minSize);
+  const scaleX = clampNum(Math.floor((CAPTION_MAX_W / widest) * 100), FLOOR_SCALEX, 100);
+  return { lines, fontSize: minSize, scaleX };
+}
+
+// 줄 구조 고정(명시적 \n 줄들)으로 fit — 재wrap 없이 폰트 축소 + \fscx 가로압축으로만 폭에 맞춘다.
+// 요청 크기부터 minSize 까지 단계적으로 낮추며 각 단계에서 가로압축(MIN_SCALEX 하한)으로 시도,
+// 끝내 안 되면 minSize + 최대 압축(FLOOR_SCALEX). 줄 수/줄 내용은 절대 바꾸지 않는다.
+function fitFixedLines(
+  lines: string[],
+  requestedSize: number,
+  minSize: number,
+): { lines: string[]; fontSize: number; scaleX: number } {
+  for (let size = requestedSize; size >= minSize; size -= 6) {
+    const widest = maxLineWidth(lines, size);
+    if (widest <= CAPTION_MAX_W) return { lines, fontSize: size, scaleX: 100 };
+    const scaleX = Math.floor((CAPTION_MAX_W / widest) * 100);
+    if (scaleX >= MIN_SCALEX) return { lines, fontSize: size, scaleX: clampNum(scaleX, MIN_SCALEX, 100) };
+  }
   const widest = maxLineWidth(lines, minSize);
   const scaleX = clampNum(Math.floor((CAPTION_MAX_W / widest) * 100), FLOOR_SCALEX, 100);
   return { lines, fontSize: minSize, scaleX };

@@ -26,6 +26,7 @@ import { generateStyleSuggest, readStyleSuggest } from '../../lib/style-suggest'
 import { DEFAULT_TTS_CONFIG, readTtsConfig, writeTtsConfig } from '../../lib/tts-config';
 import { readTtsOutline, validateOutline } from '../../lib/tts-outline';
 import { DEFAULT_AUDIO_CONFIG, readAudioConfig, writeAudioConfig } from '../../lib/audio-config';
+import { DEFAULT_CUT_CONFIG, writeCutConfig } from '../../lib/cut-config';
 import { ensureIgFetchAlive, importInstagramUrl } from '../../lib/ig-fetch';
 
 import { createJob, getJob, publicJob, setRunner } from './queue';
@@ -478,6 +479,15 @@ app.post('/api/audio-config', async (c) => {
   if (!projectId) return c.json({ error: 'projectId 누락' }, 400);
   try { await fsp.access(projectDir(projectId)); } catch { return c.json({ error: 'project 가 존재하지 않습니다' }, 404); }
   await writeAudioConfig(projectId, { ...DEFAULT_AUDIO_CONFIG, ...(audio || {}) });
+  return c.json({ ok: true });
+});
+
+// ---- 컷편집 설정 (영상 목표 길이 등) ----
+app.post('/api/cut-config', async (c) => {
+  const { projectId, cut } = await c.req.json().catch(() => ({}));
+  if (!projectId) return c.json({ error: 'projectId 누락' }, 400);
+  try { await fsp.access(projectDir(projectId)); } catch { return c.json({ error: 'project 가 존재하지 않습니다' }, 404); }
+  await writeCutConfig(projectId, { ...DEFAULT_CUT_CONFIG, ...(cut || {}) });
   return c.json({ ok: true });
 });
 

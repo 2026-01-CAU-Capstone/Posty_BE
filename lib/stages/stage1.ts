@@ -25,6 +25,7 @@ import { buildCaptionPlanningPrompt, buildImageSourceDescriptionPrompt, buildSou
 import { briefToPromptBlock, readStyleBrief } from '../style-brief';
 import { reduceSourceShots, ReduceCandidate } from '../source-reduce';
 import { CaptionLayer, preserveLayerDesign } from '../caption-ass';
+import { readCutConfig, resolveTargetRange } from '../cut-config';
 import { config } from '../config';
 
 const OUT_W = 1080;
@@ -191,11 +192,14 @@ export async function runStage1(projectId: string): Promise<{
 
   let srcVecs = await embedTexts(srcEntries.map(e => e.text));
 
-  // ---- 1c-bis: 긴 소스 축약 (추정 출력이 TARGET_MAX_SEC 초과일 때만) ----
+  // ---- 1c-bis: 긴 소스 축약 (추정 출력이 목표 max 초과일 때만) ----
+  // 목표 길이는 컷편집 옵션(cut-config) 우선, 미지정이면 레퍼런스 길이(없으면 45초).
+  const cutCfg = await readCutConfig(projectId);
+  const { targetSec, minSec, maxSec } = resolveTargetRange(cutCfg, Number(spec?.duration), TARGET_SEC);
   const estimatedSec = srcEntries.reduce(
     (sum, e) => sum + Math.max(0.05, Math.min(e.s.end - e.s.start, MAX_CUT_DUR)), 0,
   );
-  if (estimatedSec > TARGET_MAX_SEC) {
+  if (estimatedSec > maxSec) {
     const userDirectionBlock = styleNote.trim() ? styleNote.trim() : undefined;
     const cands: ReduceCandidate[] = srcEntries.map(e => ({
       video_id: e.v.video_id,
@@ -208,12 +212,13 @@ export async function runStage1(projectId: string): Promise<{
       tags: e.s.tags,
     }));
     const reduced = await reduceSourceShots(cands, srcVecs, {
-      targetSec: TARGET_SEC, minSec: TARGET_MIN_SEC, maxSec: TARGET_MAX_SEC,
+      targetSec, minSec, maxSec,
       maxCutDur: MAX_CUT_DUR, userDirectionBlock,
     });
     await appendRawResponse(projectId, {
       stage: 1, kind: 'source_reduction',
       input_shots: srcEntries.length, estimated_sec: round3(estimatedSec),
+      target_sec: targetSec, min_sec: minSec, max_sec: maxSec,
       method: reduced.method, kept: reduced.keptOrder.length,
       dedup_removed: reduced.dedupRemoved, result_sec: reduced.estimatedSec,
     });
@@ -284,14 +289,16 @@ export async function runStage1(projectId: string): Promise<{
     outCursor += useDur;
   }
 
-  // ---- 1d-bis: caption planning (각 컷의 자막을 ref 패턴 + 소스 내용 + styleBrief + styleNote 로 미리 작성) ----
-  await planCaptions(projectId, plan, spec);
+  // ---- 자막 플래닝은 Stage 3 으로 이동 ----
+  // 이전엔 여기서(컷을 보기도 전에) 자막을 정했다. 이제 컷+보정 후 Stage 3 에서 편집본(graded.mp4)을
+  // 시각 그라운딩으로 보고 플래닝한다 → 장면에 맞는 자막 + 자막만 재생성(Stage 3 재실행)이 가능.
+  // (planned_caption_layers 는 빈 채로 둔다. Stage 3 가 채운다. ref_caption_layers 는 STYLE 참고용으로 유지.)
 
   const editPlan = {
     aspect_ratio: '9:16',
     output_duration: round3(outCursor),
     items: plan,
-    note: '각 source shot 이 한 컷씩 사용됨. ref shot 은 STYLE 만 제공. 자막은 Stage 1 끝에서 미리 작성됨.',
+    note: '각 source shot 이 한 컷씩 사용됨. ref shot 은 STYLE 만 제공. 자막은 Stage 3 에서 편집본을 보고 작성됨.',
   };
   await writeJson(ARTIFACTS.editPlan(projectId), editPlan);
 
@@ -673,6 +680,7 @@ export async function planCaptions(
   plan: EditPlanItem[],
   spec: any,
   extraFeedback?: string,
+  groundingFrames?: MediaPart[],   // 각 cut 의 편집본 프레임(같은 순서/개수) — 있으면 멀티파트로 시각 그라운딩.
 ): Promise<void> {
   if (!config.GEMINI_API_KEY) {
     fallbackToRefLayers(plan);
@@ -706,21 +714,32 @@ export async function planCaptions(
     matched_ref_layers: it.ref_caption_layers || [],
   }));
 
-      const prompt = buildCaptionPlanningPrompt({
-        userDirectionBlock,
-        captionMode: brief.caption_mode,
-        captionLanguage: brief.caption_language,
-        refCutsWithLayers,
-        refPattern,
+  // 편집본 프레임이 cut 수와 1:1 로 들어왔으면 시각 그라운딩(멀티파트) 사용.
+  const grounded = Array.isArray(groundingFrames) && groundingFrames.length === plan.length && plan.length > 0;
+
+  const prompt = buildCaptionPlanningPrompt({
+    userDirectionBlock,
+    captionMode: brief.caption_mode,
+    captionLanguage: brief.caption_language,
+    refCutsWithLayers,
+    refPattern,
     cuts,
     extraFeedback,
+    groundedFrames: grounded,
   });
 
   try {
     // temperature 0.5: 창의적 변형 줄이고 지시(폰트 복사, 카테고리 유지 등) 충실하게.
-    let { parsed } = await callGeminiTextOnly(prompt, { temperature: 0.5, maxOutputTokens: 16384 });
+    let parsed: any;
+    if (grounded) {
+      const r = await analyzeMultiPartStructured(groundingFrames!, prompt, config.GEMINI_FLASH_MODEL);
+      parsed = r.parsed;
+    } else {
+      const r = await callGeminiTextOnly(prompt, { temperature: 0.5, maxOutputTokens: 16384 });
+      parsed = r.parsed;
+    }
     await appendRawResponse(projectId, {
-      stage: 1, kind: 'caption_planning',
+      stage: 1, kind: 'caption_planning', grounded,
       cuts_count: cuts.length, raw_returned: Array.isArray(parsed?.cuts) ? parsed.cuts.length : 0,
       with_feedback: !!extraFeedback,
       caption_language: brief.caption_language || 'ref',
@@ -738,8 +757,11 @@ export async function planCaptions(
           extraFeedback || '',
           languageRetryInstruction(brief.caption_language),
         ].filter(Boolean).join('\n\n'),
+        groundedFrames: grounded,
       });
-      const retry = await callGeminiTextOnly(retryPrompt, { temperature: 0.35, maxOutputTokens: 16384 });
+      const retry = grounded
+        ? await analyzeMultiPartStructured(groundingFrames!, retryPrompt, config.GEMINI_FLASH_MODEL)
+        : await callGeminiTextOnly(retryPrompt, { temperature: 0.35, maxOutputTokens: 16384 });
       parsed = retry.parsed;
       await appendRawResponse(projectId, {
         stage: 1, kind: 'caption_planning_language_retry',
@@ -757,6 +779,10 @@ export async function planCaptions(
     fallbackToRefLayers(plan);
     enforceCaptionMode(plan, brief.caption_mode, brief.caption_density);
   }
+
+  // 레퍼런스의 자막 시간 위치 재현 — 레퍼런스가 자막을 띄운 타임라인 구간의 컷에만 자막을 남긴다.
+  // (예: 레퍼런스가 앞부분에만 타이틀을 띄웠으면 사용자 영상도 앞부분 컷에만.)
+  applyReferenceCaptionTiming(plan, spec, brief.caption_mode);
 }
 
 function applyCaptionPlanFromParsed(plan: EditPlanItem[], parsed: any, captionMode?: string, captionDensity?: string): void {
@@ -792,14 +818,41 @@ function applyCaptionPlanFromParsed(plan: EditPlanItem[], parsed: any, captionMo
 // 않아 자막 "형태"는 그대로 유지된다. ref[k] 가 없으면 손대지 않아 렌더 단계 sanitizeLayer
 // 가 caption_global_style 로 폴백할 여지를 남긴다.
 // ============================================================
+// 두 hex 색의 거리 (0=동일 ~ 1=정반대). reinject 의 색 기반 레이어 매칭용.
+function colorDistance(a?: string, b?: string): number {
+  const rgb = (hex?: string): [number, number, number] | null => {
+    const h = String(hex || '').replace('#', '');
+    if (!/^[0-9a-fA-F]{6}$/.test(h)) return null;
+    return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+  };
+  const ra = rgb(a), rb = rgb(b);
+  if (!ra || !rb) return Infinity;
+  return (Math.abs(ra[0] - rb[0]) + Math.abs(ra[1] - rb[1]) + Math.abs(ra[2] - rb[2])) / 765;
+}
+
 export function reinjectRefStyle(planned: CaptionLayer[], ref?: CaptionLayer[]): CaptionLayer[] {
   if (!Array.isArray(planned) || planned.length === 0) return planned;
   if (!Array.isArray(ref) || ref.length === 0) return planned;
 
   const str = (v: any): string | undefined => (typeof v === 'string' && v.trim() ? v : undefined);
 
+  // planned ↔ ref 레이어 매칭: 색이 가장 가까운 ref(흰↔흰, 노랑↔노랑)를 우선 매칭하고, 실패 시 인덱스.
+  // (이전엔 ref[k] 인덱스로만 매칭 → ref 레이어 순서가 다른 컷에서 두 자막의 색/위치가 뒤바뀌었다.)
+  const usedRef = new Set<number>();
+  const pickRef = (p: CaptionLayer, k: number): CaptionLayer | undefined => {
+    let best = -1, bestD = 0.18;
+    for (let j = 0; j < ref.length; j++) {
+      if (usedRef.has(j)) continue;
+      const d = colorDistance(p.color_hex, ref[j].color_hex);
+      if (d < bestD) { bestD = d; best = j; }
+    }
+    if (best >= 0) { usedRef.add(best); return ref[best]; }
+    if (k < ref.length && !usedRef.has(k)) { usedRef.add(k); return ref[k]; }
+    return undefined;
+  };
+
   return planned.map((p, k) => {
-    const r = ref[k];
+    const r = pickRef(p, k);
     if (!r || typeof r !== 'object') return p; // 매칭 ref layer 없음 → LLM 값 유지(이후 global 폴백)
     const out: CaptionLayer = { ...p };
 
@@ -809,6 +862,7 @@ export function reinjectRefStyle(planned: CaptionLayer[], ref?: CaptionLayer[]):
     if (typeof r.has_background_box === 'boolean') out.has_background_box = r.has_background_box;
     const boxColor = str(r.background_color_hex);
     if (boxColor) out.background_color_hex = boxColor;
+    if (Number.isFinite(r.background_alpha as number)) out.background_alpha = r.background_alpha;
     if (Number.isFinite(r.background_padding as number)) out.background_padding = r.background_padding;
     const outlineColor = str(r.outline_color_hex);
     if (outlineColor) out.outline_color_hex = outlineColor;
@@ -817,10 +871,20 @@ export function reinjectRefStyle(planned: CaptionLayer[], ref?: CaptionLayer[]):
     if (typeof r.has_shadow === 'boolean') out.has_shadow = r.has_shadow;
     const shadowColor = str(r.shadow_color_hex);
     if (shadowColor) out.shadow_color_hex = shadowColor;
+    // 그림자 기하(흐림/오프셋) — ref 그대로 재주입해야 부드러운 그림자/헤일로가 렌더까지 살아남는다.
+    // (이전엔 재주입 대상이 아니어서 plan 후 sanitize 기본값 blur=무시 / offset y=4 로 뭉개졌다.)
+    if (Number.isFinite(r.shadow_blur as number)) out.shadow_blur = r.shadow_blur;
+    if (Number.isFinite(r.shadow_offset_x as number)) out.shadow_offset_x = r.shadow_offset_x;
+    if (Number.isFinite(r.shadow_offset_y as number)) out.shadow_offset_y = r.shadow_offset_y;
     if (typeof r.has_glow === 'boolean') out.has_glow = r.has_glow;
     const glowColor = str(r.glow_color_hex);
     if (glowColor) out.glow_color_hex = glowColor;
+    if (Number.isFinite(r.glow_radius as number)) out.glow_radius = r.glow_radius;
     if (r.gradient && typeof r.gradient === 'object') out.gradient = r.gradient;
+    // 글자 모양 힌트 — ref 의 폰트 인상을 따르도록 재주입 (형태 무관).
+    const ffh = str(r.font_family_hint); if (ffh) out.font_family_hint = ffh;
+    const fw = str(r.font_width); if (fw) out.font_width = fw;
+    const fwh = str(r.font_weight_hint); if (fwh) out.font_weight_hint = fwh;
     // color_runs(글자 중간 색변경)는 ref 에 있고 LLM 이 자체 runs 를 만들지 않았을 때만
     // ref 색 시퀀스를 빌려온다 (렌더러가 grapheme 순서로 매핑하므로 텍스트가 달라도 색만 따라감).
     if ((!Array.isArray(p.color_runs) || p.color_runs.length < 2)
@@ -836,6 +900,8 @@ export function reinjectRefStyle(planned: CaptionLayer[], ref?: CaptionLayer[]):
     // 좌표 기반 위치 — ref 의 정밀 세로/가로 위치를 그대로 복원 (가로가 center 로 뭉개지지 않게).
     if (Number.isFinite(r.vertical_ratio as number)) out.vertical_ratio = r.vertical_ratio;
     if (Number.isFinite(r.horizontal_ratio as number)) out.horizontal_ratio = r.horizontal_ratio;
+    // 정밀 글자 크기 — ref 의 실제 크기 비율을 그대로 복제 (크기는 텍스트 길이와 무관하므로 안전).
+    if (Number.isFinite(r.size_ratio as number)) out.size_ratio = r.size_ratio;
 
     return out;
   });
@@ -852,13 +918,82 @@ function enforceCaptionMode(plan: EditPlanItem[], captionMode?: string, captionD
     for (const it of plan) it.planned_caption_layers = cloneLayers(layers);
     return;
   }
+  if (mode === 'brand_title') { enforceBrandTitle(plan); return; }
   if (!captionMode) enforceCaptionDensity(plan, captionDensity);
 }
 
-function normalizeCaptionMode(captionMode?: string, captionDensity?: string): 'none' | 'per_scene' | 'continuous' {
-  if (captionMode === 'none' || captionMode === 'continuous' || captionMode === 'per_scene') return captionMode;
+function normalizeCaptionMode(captionMode?: string, captionDensity?: string): 'none' | 'per_scene' | 'continuous' | 'brand_title' {
+  if (captionMode === 'none' || captionMode === 'continuous' || captionMode === 'per_scene' || captionMode === 'brand_title') return captionMode;
   if (captionDensity === 'none') return 'none';
   return 'per_scene';
+}
+
+// 브랜드 타이틀 모드 — 유채색(비-흰색) 레이어를 가장 흔한 문구(브랜드/장소명)로 모든 컷에 고정.
+// 흰색 훅 레이어는 LLM 이 컷마다 변주한 그대로 둔다.
+export function enforceBrandTitle(plan: EditPlanItem[]): void {
+  const isAccent = (l: CaptionLayer) => {
+    const hex = String(l.color_hex || '').replace('#', '').toLowerCase();
+    return !!hex && hex !== 'ffffff' && hex !== 'fff';
+  };
+  const counts = new Map<string, number>();
+  for (const it of plan) for (const l of (it.planned_caption_layers || [])) {
+    const t = String(l.text || '').trim();
+    if (t && isAccent(l)) counts.set(t, (counts.get(t) || 0) + 1);
+  }
+  let brand = '', max = 0;
+  for (const [t, c] of counts) if (c > max) { max = c; brand = t; }
+  if (!brand) return;
+  for (const it of plan) for (const l of (it.planned_caption_layers || [])) {
+    if (isAccent(l)) l.text = brand;
+  }
+}
+
+// ============================================================
+// 레퍼런스의 자막 "시간 위치" 재현.
+// ----------------------------------------------------------------
+// 컷편집이 레퍼런스 스타일을 내용 유사도로 따라가다 보니, 자막도 "내용이 비슷한 컷"마다
+// 붙어 타임라인 전체에 흩뿌려진다. 하지만 레퍼런스에서 자막이 뜨는 "시간 위치"(예: 앞부분
+// 타이틀)도 따라가야 자연스럽다. → 레퍼런스가 자막을 띄운 타임라인 비율 구간을 모아,
+// 그 구간(±여유)에 해당하는 사용자 컷에만 자막을 남기고 나머지 컷 자막은 제거한다.
+//   · continuous/none 모드는 제외(전체 유지/없음은 별도 의미).
+//   · 레퍼런스가 거의 전 구간(>85%) 자막이거나 자막이 아예 없으면 noop.
+// ============================================================
+export function applyReferenceCaptionTiming(plan: EditPlanItem[], spec: any, captionMode?: string): void {
+  if (captionMode === 'continuous' || captionMode === 'none') return;
+  const shots: any[] = Array.isArray(spec?.shots) ? spec.shots : [];
+  if (shots.length === 0) return;
+  const dur = Number(spec?.duration) > 0 ? Number(spec.duration) : (Number(shots[shots.length - 1]?.end) || 0);
+  if (!(dur > 0)) return;
+
+  // 자막 있는 ref 샷 → 타임라인 비율 구간 수집 후 병합.
+  const intervals: Array<[number, number]> = [];
+  for (const s of shots) {
+    const hasCap = Array.isArray(s?.caption_layers) && s.caption_layers.some((l: any) => String(l?.text || '').trim());
+    if (!hasCap) continue;
+    const a = Math.max(0, Math.min(1, (Number(s.start) || 0) / dur));
+    const b = Math.max(0, Math.min(1, (Number(s.end) || 0) / dur));
+    if (b > a) intervals.push([a, b]);
+  }
+  if (intervals.length === 0) return;
+  intervals.sort((x, y) => x[0] - y[0]);
+  const merged: Array<[number, number]> = [[intervals[0][0], intervals[0][1]]];
+  for (let i = 1; i < intervals.length; i++) {
+    const last = merged[merged.length - 1];
+    if (intervals[i][0] <= last[1] + 0.02) last[1] = Math.max(last[1], intervals[i][1]);
+    else merged.push([intervals[i][0], intervals[i][1]]);
+  }
+  const coverage = merged.reduce((s, [a, b]) => s + (b - a), 0);
+  if (coverage >= 0.85) return;   // 레퍼런스가 거의 전 구간 자막 → 시간 제약 무의미.
+
+  const total = plan.reduce((m, it) => Math.max(m, Number(it.output_end) || 0), 0);
+  if (!(total > 0)) return;
+  const inRef = (frac: number) => merged.some(([a, b]) => frac >= a - 0.03 && frac <= b + 0.03);
+
+  for (const it of plan) {
+    if (!it.planned_caption_layers || it.planned_caption_layers.length === 0) continue;
+    const mid = ((Number(it.output_start) || 0) + (Number(it.output_end) || 0)) / 2 / total;
+    if (!inRef(mid)) it.planned_caption_layers = [];   // 레퍼런스가 그 시점엔 자막을 안 띄움 → 제거.
+  }
 }
 
 function pickContinuousCaptionLayers(plan: EditPlanItem[]): CaptionLayer[] {

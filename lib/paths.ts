@@ -70,6 +70,7 @@ export const ARTIFACTS = {
   ttsConfig: (pid: string) => path.join(projectDir(pid), 'tts-config.json'),
   ttsOutline: (pid: string) => path.join(projectDir(pid), 'tts-outline.json'),
   audioConfig: (pid: string) => path.join(projectDir(pid), 'audio-config.json'),
+  cutConfig: (pid: string) => path.join(projectDir(pid), 'cut-config.json'),
   ttsAudioDir: (pid: string) => path.join(stageDir(pid, 4), 'tts'),
   rawResponses: (pid: string) => path.join(projectDir(pid), 'raw-api-responses.json'),
   styleNote: (pid: string) => path.join(projectDir(pid), 'style-note.txt'),

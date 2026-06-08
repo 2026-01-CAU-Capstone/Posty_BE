@@ -20,10 +20,12 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { ARTIFACTS, appendRawResponse, ensureDir, readJson, stageDir } from '../paths';
-import { runFfmpeg } from '../ffmpeg';
+import { ARTIFACTS, appendRawResponse, ensureDir, readJson, stageDir, workDir, writeJson } from '../paths';
+import { runFfmpeg, extractFrame } from '../ffmpeg';
+import { MediaPart } from '../gemini';
 import { bundledFontsDir } from '../fonts';
 import { buildCaptionAss, CaptionLayer, CutInput, GlobalCaptionStyle } from '../caption-ass';
+import { planCaptions } from './stage1';
 
 export async function runStage3(projectId: string): Promise<{
   ok: true;
@@ -41,6 +43,22 @@ export async function runStage3(projectId: string): Promise<{
 
   const items: any[] = plan.items;
   const globalStyle: GlobalCaptionStyle = spec?.caption_global_style || {};
+
+  // 0) 자막 플래닝 (편집본 시각 그라운딩) — 컷+보정이 끝난 graded.mp4 의 각 컷 프레임을 보고
+  //    장면에 맞는 자막을 생성한다. (이전엔 Stage1 에서 컷을 보기 전에 플래닝했음.)
+  //    Stage 3 재실행만으로 자막을 재생성할 수 있다(컷 재편집 불필요).
+  try {
+    const frames = await extractCutFramesForPlanning(projectId, items, graded);
+    await planCaptions(projectId, items, spec || {}, undefined, frames);
+    await writeJson(ARTIFACTS.editPlan(projectId), plan);
+    await appendRawResponse(projectId, {
+      stage: 3, kind: 'caption_planning_in_stage3', cuts: items.length, grounded: !!frames,
+    });
+  } catch (e: any) {
+    await appendRawResponse(projectId, {
+      stage: 3, kind: 'caption_planning_in_stage3_failed', error: e.message || String(e),
+    });
+  }
 
   // 1) 각 컷의 layer 결정 — planned 우선, 없으면 매칭된 ref 사용
   const layersPerCut: CaptionLayer[][] = items.map((it: any) => {
@@ -125,4 +143,29 @@ export async function runStage3(projectId: string): Promise<{
 
 async function fileOk(p: string): Promise<boolean> {
   try { await fs.access(p); return true; } catch { return false; }
+}
+
+// 각 컷의 대표 프레임(중간 시점)을 graded.mp4 에서 뽑아 caption planning 의 시각 그라운딩에 쓴다.
+// 모든 컷의 프레임이 다 나와야(순서/개수 1:1) 반환, 하나라도 실패하면 undefined → 텍스트 전용 플래닝으로 폴백.
+async function extractCutFramesForPlanning(
+  projectId: string,
+  items: any[],
+  gradedPath: string,
+): Promise<MediaPart[] | undefined> {
+  try {
+    const dir = path.join(workDir(projectId), '_caption_plan_frames');
+    await ensureDir(dir);
+    const frames: MediaPart[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const s = Number(items[i]?.output_start) || 0;
+      const e = Number(items[i]?.output_end) || (s + 1);
+      const mid = Math.max(0, (s + e) / 2);
+      const fp = path.join(dir, `cut_${String(i).padStart(3, '0')}.jpg`);
+      await extractFrame(gradedPath, mid, fp, 640);
+      frames.push({ filePath: fp, mimeType: 'image/jpeg' });
+    }
+    return frames.length === items.length && frames.length > 0 ? frames : undefined;
+  } catch {
+    return undefined;
+  }
 }
