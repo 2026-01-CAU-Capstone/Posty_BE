@@ -69,6 +69,7 @@ export async function analyzeMultiPartStructured(
   mediaParts: MediaPart[],
   prompt: string,
   model?: string,
+  opts?: { temperature?: number },
 ): Promise<GeminiResult> {
   if (!config.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY 가 설정되지 않았습니다');
 
@@ -93,7 +94,8 @@ export async function analyzeMultiPartStructured(
     contents: [{ role: 'user', parts }],
     generationConfig: {
       responseMimeType: 'application/json',
-      temperature: 0.2,
+      // 기본은 낮은 temperature(충실한 묘사/분석). 재생성 등 변형이 필요하면 caller 가 올린다.
+      temperature: opts?.temperature ?? 0.2,
       maxOutputTokens: 65536,
     },
   };

@@ -123,6 +123,42 @@ export async function extractFrame(
   ]);
 }
 
+// 추출된 프레임 이미지에서 '가로 전체 × 세로 밴드' 를 크롭 + 업스케일한다.
+// 자막은 가로로 길어, 자막의 세로 중심(verticalRatio) 기준 밴드를 잘라 업스케일하면
+// 자막이 이미지를 꽉 채워 VLM 이 색/박스/그림자/굵기를 풀프레임보다 정확히 읽는다.
+// iw/ih 식으로 처리해 원본 프레임 해상도를 몰라도 동작한다. (필터식 내부 콤마는 \, 로 이스케이프)
+export async function cropBand(
+  srcImage: string,
+  outPath: string,
+  verticalRatio: number,
+  bandFrac: number,
+  outWidth = 1280,
+): Promise<void> {
+  const vr = Math.max(0, Math.min(1, Number(verticalRatio) || 0.5));
+  const F = Math.max(0.05, Math.min(0.9, Number(bandFrac) || 0.24));
+  const f = F.toFixed(4);
+  // 밴드 상단 y = 중심 - F/2, [0, ih*(1-F)] 로 클램프.
+  const y = `max(0\\,min(ih*(1-${f})\\,ih*${vr.toFixed(4)}-ih*${(F / 2).toFixed(4)}))`;
+  const vf = `crop=iw:ih*${f}:0:${y},scale=${outWidth}:-2:flags=lanczos`;
+  await runFfmpeg(['-y', '-i', srcImage, '-vf', vf, '-frames:v', '1', '-q:v', '3', outPath]);
+}
+
+// 정규화 bbox(0~1) 영역을 패딩 포함 크롭 + 업스케일. (로컬라이제이션으로 찾은 자막 위치를 타이트하게 자를 때)
+export async function cropRegion(
+  srcImage: string,
+  outPath: string,
+  x: number, y: number, w: number, h: number,   // 정규화 0~1 (좌상단 x,y + 폭/높이)
+  pad = 0.04,
+  outWidth = 1280,
+): Promise<void> {
+  const c01 = (v: number) => Math.max(0, Math.min(1, Number(v)));
+  const x0 = c01(x - pad), y0 = c01(y - pad);
+  const x1 = c01(x + w + pad), y1 = c01(y + h + pad);
+  const cw = Math.max(0.02, x1 - x0), ch = Math.max(0.02, y1 - y0);
+  const vf = `crop=iw*${cw.toFixed(4)}:ih*${ch.toFixed(4)}:iw*${x0.toFixed(4)}:ih*${y0.toFixed(4)},scale=${outWidth}:-2:flags=lanczos`;
+  await runFfmpeg(['-y', '-i', srcImage, '-vf', vf, '-frames:v', '1', '-q:v', '3', outPath]);
+}
+
 // 영상 → 단일 mp3 오디오. Gemini 가 안정적으로 받는 포맷.
 // mono / 24kHz / 48kbps 로 충분 (발화 식별 목적).
 export async function extractAudio(filePath: string, outPath: string): Promise<void> {

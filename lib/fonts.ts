@@ -145,47 +145,72 @@ const BY_CATEGORY: Record<string, string[]> = {
   display:     [F.BlackHanSans, F.DoHyeon, F.Jua, F.YeonSung],
 };
 
-// emphasis=black / bold+bold_impact 시 우선시할 헤비웨이트 폰트.
-// 한글에서 weight 900 효과를 family로 흉내냄 (libass 의 ASS Bold 는 인공 굵기라 어색).
-const HEAVY_FONTS = new Set<string>([F.BlackHanSans, F.DoHyeon, F.Jua]);
+// 폰트 이름 정규화 — 공백/특수문자 제거 + 소문자.
+function normFamilyName(s: string): string {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9가-힣]/g, '');
+}
 
-// "강한 인상" 이 필요한 personality — 여기서는 bold 도 heavy 로 승급.
-const HEAVY_FOR_BOLD_PERSONALITIES = new Set<string>(['bold_impact', 'retro', 'display_decorative']);
+// 번들 family 의 정규화 이름 → 실제 family (font_family_hint 직접 매칭용).
+const NORMALIZED_BUNDLED: Record<string, string> = (() => {
+  const m: Record<string, string> = {};
+  for (const fam of Object.values(FONT_FAMILIES)) m[normFamilyName(fam)] = fam;
+  return m;
+})();
+
+// 흔한 비번들 폰트(상용/시스템) → 가장 가까운 번들 family 별칭.
+// (레퍼런스에서 추정된 font_family_hint 가 번들에 없을 때 근사 매핑)
+const FAMILY_ALIASES: Record<string, string> = {
+  notosans: F.NanumGothic, notosanskr: F.NanumGothic, notosanscjk: F.NanumGothic,
+  applesdgothicneo: F.Pretendard, spoqahansans: F.Pretendard, malgungothic: F.Pretendard,
+  nanumsquare: F.NanumGothic, nanumsquareround: F.GowunDodum, nanumbarungothic: F.NanumGothic,
+  spongofont: F.Jua, bmhanna: F.DoHyeon, bmhannapro: F.DoHyeon, bmjua: F.Jua, bmdohyeon: F.DoHyeon,
+  tvnenjoystories: F.DoHyeon, gmarketsans: F.DoHyeon, jalnan: F.DoHyeon,
+  배달의민족주아: F.Jua, 배달의민족도현: F.DoHyeon, 검은고딕: F.BlackHanSans,
+  나눔손글씨: F.NanumPenScript, 카페24: F.YeonSung,
+  // 한글 상용 '둥근 굵은 고딕' 류 → 가장 가까운 rounded heavy 번들(Do Hyeon)로 통일.
+  // (얇은 기본 폰트나 각진 폰트로 새지 않게. 같은 제목 자막 쌍이 같은 폰트로 렌더되도록.)
+  g마켓산스: F.DoHyeon, 지마켓산스: F.DoHyeon, 잘난체: F.DoHyeon, 여기어때잘난체: F.DoHyeon,
+  배달의민족한나: F.DoHyeon, 한나체: F.DoHyeon, 한나: F.DoHyeon, 주아체: F.Jua, 도현체: F.DoHyeon,
+};
+
+// font_family_hint → 번들 family (직접 또는 별칭). 못 찾으면 null.
+function familyFromHint(hint?: string): string | null {
+  const n = normFamilyName(hint || '');
+  if (!n) return null;
+  if (NORMALIZED_BUNDLED[n]) return NORMALIZED_BUNDLED[n];
+  if (FAMILY_ALIASES[n]) return FAMILY_ALIASES[n];
+  // 부분 포함 매칭 (예: "blackhansansbold" → blackhansans)
+  for (const key of Object.keys(NORMALIZED_BUNDLED)) {
+    if (n.includes(key) || key.includes(n)) return NORMALIZED_BUNDLED[key];
+  }
+  return null;
+}
 
 export function pickBundledFont(args: {
   category?: string;
   personality?: string;
-  emphasis?: string;        // regular | bold | black
+  emphasis?: string;        // (미사용) — 폰트 간 우선순위를 두지 않으므로 emphasis 로 폰트를 바꾸지 않는다.
+  familyHint?: string;      // 레퍼런스 폰트 이름 추정 — 번들/별칭에 매칭되면 무조건 이걸 사용(원본 폰트 그대로).
+  weightHint?: string;      // (미사용) — 위와 동일. heavy 승급 휴리스틱 제거.
 }): string {
   const cat = (args.category || 'sans').toLowerCase();
   const per = (args.personality || '').toLowerCase();
-  const emp = (args.emphasis || 'bold').toLowerCase();
 
-  // 1) (category, personality) 정확 매칭
+  // ─────────────────────────────────────────────────────
+  // 0) 원본과 같은 폰트로 맞추기 (최우선이자 사실상 유일한 기준).
+  //    font_family_hint(레퍼런스에서 추정한 실제 폰트)이 번들/별칭과 매칭되면 무조건 그 폰트로 렌더한다.
+  //    폰트 간 우선순위·emphasis/weight 기반 heavy 승급 같은 휴리스틱은 두지 않는다 —
+  //    "레퍼런스 폰트를 그대로 따라가는 것" 이 목적이므로, 우리가 임의로 다른 폰트를 끼워넣지 않는다.
+  // ─────────────────────────────────────────────────────
+  const hinted = familyFromHint(args.familyHint);
+  if (hinted) return hinted;
+
+  // 1) hint 가 없거나 못 풀 때만 — (category, personality) 의 대표 폰트로 결정적 폴백.
+  //    같은 (category, personality) 면 항상 같은 폰트 → 영상 내 일관성. (heavy 승급 없음)
   let pool: string[] | undefined;
-  if (per) pool = BY_COMBO[`${cat}/${per}`];
-  // 2) personality 단독
-  if (!pool || pool.length === 0) pool = per ? BY_PERSONALITY[per] : undefined;
-  // 3) category 단독
-  if (!pool || pool.length === 0) pool = BY_CATEGORY[cat];
-  // 4) 최후 폴백
-  if (!pool || pool.length === 0) pool = [F.Pretendard];
-
-  // emphasis=black 이면 무조건 heavy 폰트 우선
-  if (emp === 'black') {
-    const heavy = pool.find(f => HEAVY_FONTS.has(f));
-    if (heavy) return heavy;
-  }
-  // emphasis=bold + 강한 personality 면 heavy 폰트 우선 (ASS 인공 굵기 대신 family 로 굵기 표현)
-  if (emp === 'bold' && HEAVY_FOR_BOLD_PERSONALITIES.has(per)) {
-    const heavy = pool.find(f => HEAVY_FONTS.has(f));
-    if (heavy) return heavy;
-  }
-
-  // ─────────────────────────────────────────────────────
-  // 같은 (category, personality) 면 항상 같은 폰트 → 영상 내 일관성.
-  // (이전엔 layerIndex 로 분기해서 같은 ref 패턴의 인접 layer 가 다른 폰트로 뽑히곤 했음 — ref 와 괴리의 한 원인)
-  // 첫 폰트가 가장 representative 라는 규약으로 BY_COMBO/BY_PERSONALITY 풀을 정렬해두고, 그 첫 폰트만 사용.
-  // ─────────────────────────────────────────────────────
+  if (per) pool = BY_COMBO[`${cat}/${per}`];                     // (category, personality) 정확 매칭
+  if (!pool || pool.length === 0) pool = per ? BY_PERSONALITY[per] : undefined; // personality 단독
+  if (!pool || pool.length === 0) pool = BY_CATEGORY[cat];       // category 단독
+  if (!pool || pool.length === 0) pool = [F.Pretendard];         // 최후 폴백
   return pool[0];
 }

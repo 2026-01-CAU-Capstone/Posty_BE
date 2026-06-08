@@ -20,12 +20,14 @@ import {
 import { ensurePreviewFrames } from '../../lib/preview-frames';
 import { fetchBgmCandidates, downloadBgmTrack, BgmCandidate } from '../../lib/archive';
 import { identifyReferenceBgm } from '../../lib/bgm-identify';
+import { suggestFamousTracks } from '../../lib/bgm-suggest';
 import { checkStageConfig, StageId } from '../../lib/config';
 import { DEFAULT_BRIEF, readStyleBrief, writeStyleBrief } from '../../lib/style-brief';
 import { generateStyleSuggest, readStyleSuggest } from '../../lib/style-suggest';
 import { DEFAULT_TTS_CONFIG, readTtsConfig, writeTtsConfig } from '../../lib/tts-config';
 import { readTtsOutline, validateOutline } from '../../lib/tts-outline';
 import { DEFAULT_AUDIO_CONFIG, readAudioConfig, writeAudioConfig } from '../../lib/audio-config';
+import { DEFAULT_CUT_CONFIG, writeCutConfig } from '../../lib/cut-config';
 import { ensureIgFetchAlive, importInstagramUrl } from '../../lib/ig-fetch';
 
 import { createJob, getJob, publicJob, setRunner } from './queue';
@@ -385,7 +387,8 @@ app.get('/api/bgm-candidates', async (c) => {
   const cachePath = path.join(projectDir(projectId), '4_final', 'bgm-candidates.json');
   if (!force) {
     const cached = await readJson<any>(cachePath);
-    if (cached && Array.isArray(cached.candidates) && cached.candidates.length > 0) {
+    // 새 응답 모양(paid/free)일 때만 캐시 채택. 옛 모양(candidates)은 무시하고 재생성.
+    if (cached && Array.isArray(cached.free) && (cached.free.length > 0 || (cached.paid?.length > 0))) {
       return c.json({ ok: true, ...cached, cached: true });
     }
   }
@@ -394,14 +397,16 @@ app.get('/api/bgm-candidates', async (c) => {
   if (!spec) return c.json({ error: '레퍼런스 분석 결과가 없습니다 (Stage 0 먼저 실행)' }, 400);
   const audioProfile = spec.audio_profile || {};
 
-  // 레퍼런스 BGM 식별 (토큰 있을 때만 — 실패해도 무시)
+  // 레퍼런스 BGM 식별 (AUDD 토큰 있을 때만 — 실패해도 무시). 식별되면 맨 위 + 유료 추천 앵커로 사용.
   let referenceBgm: any = null;
+  let refIdentity: any = undefined;
   try {
     const dir = referenceDir(projectId);
     const files = (await fsp.readdir(dir).catch(() => [])).filter(f => !f.startsWith('.'));
     if (files.length > 0) {
       const refFile = path.join(dir, files[0]);
       const r = await identifyReferenceBgm(refFile, path.join(projectDir(projectId), '4_final', 'tmp'));
+      refIdentity = r.identity;
       referenceBgm = {
         status: r.status,
         title: r.identity?.title,
@@ -416,14 +421,17 @@ app.get('/api/bgm-candidates', async (c) => {
     }
   } catch { /* 무시 */ }
 
-  try {
-    const candidates: BgmCandidate[] = await fetchBgmCandidates(audioProfile, 6);
-    const payload = { profile: audioProfile, referenceBgm, candidates };
-    await writeJson(cachePath, payload);
-    return c.json({ ok: true, ...payload, cached: false });
-  } catch (e: any) {
-    return c.json({ error: e?.message || String(e) }, 500);
-  }
+  // 무료(Internet Archive) + 유료/유명(Gemini 추천) 을 병렬로. 둘 다 실패해도 가능한 만큼 반환.
+  const [freeRes, paidRes] = await Promise.allSettled([
+    fetchBgmCandidates(audioProfile, 3),
+    suggestFamousTracks(audioProfile, refIdentity, 3),
+  ]);
+  const free: BgmCandidate[] = freeRes.status === 'fulfilled' ? freeRes.value : [];
+  const paid = paidRes.status === 'fulfilled' ? paidRes.value : [];
+
+  const payload = { profile: audioProfile, referenceBgm, paid, free };
+  await writeJson(cachePath, payload);
+  return c.json({ ok: true, ...payload, cached: false });
 });
 
 // ============================================================
@@ -478,6 +486,15 @@ app.post('/api/audio-config', async (c) => {
   if (!projectId) return c.json({ error: 'projectId 누락' }, 400);
   try { await fsp.access(projectDir(projectId)); } catch { return c.json({ error: 'project 가 존재하지 않습니다' }, 404); }
   await writeAudioConfig(projectId, { ...DEFAULT_AUDIO_CONFIG, ...(audio || {}) });
+  return c.json({ ok: true });
+});
+
+// ---- 컷편집 설정 (영상 목표 길이 등) ----
+app.post('/api/cut-config', async (c) => {
+  const { projectId, cut } = await c.req.json().catch(() => ({}));
+  if (!projectId) return c.json({ error: 'projectId 누락' }, 400);
+  try { await fsp.access(projectDir(projectId)); } catch { return c.json({ error: 'project 가 존재하지 않습니다' }, 404); }
+  await writeCutConfig(projectId, { ...DEFAULT_CUT_CONFIG, ...(cut || {}) });
   return c.json({ ok: true });
 });
 
