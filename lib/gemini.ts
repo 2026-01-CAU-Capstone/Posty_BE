@@ -190,23 +190,30 @@ export async function callGeminiTextOnly(
     // 단순 추출/요약처럼 추론이 거의 필요 없으면 0 으로 끄는 게 안전 (출력 토큰 보존).
     // undefined 면 모델 기본값(=자동).
     thinkingBudget?: number;
+    // 구글 검색 그라운딩 — 응답 전에 웹을 검색해 최신 정보(트렌드 등)를 반영한다.
+    // 검색 도구는 JSON 강제 모드(responseMimeType)와 함께 못 쓰므로, 켜면 JSON 강제를 끄고
+    // 응답 텍스트에서 JSON 을 느슨 파싱한다 (parseJsonLoose).
+    groundWithSearch?: boolean;
   },
 ): Promise<any> {
   if (!config.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY 가 설정되지 않았습니다');
   const model = opts?.model || config.GEMINI_FLASH_MODEL;
   const url = `${config.GEMINI_API_BASE}/v1beta/models/${model}:generateContent`;
+  const grounded = opts?.groundWithSearch === true;
   const generationConfig: any = {
-    responseMimeType: 'application/json',
     temperature: opts?.temperature ?? 0.6,
     maxOutputTokens: opts?.maxOutputTokens ?? 16384,
   };
+  // 그라운딩이 아닐 때만 JSON 강제 (검색 도구와 동시 사용 불가).
+  if (!grounded) generationConfig.responseMimeType = 'application/json';
   if (typeof opts?.thinkingBudget === 'number') {
     generationConfig.thinkingConfig = { thinkingBudget: opts.thinkingBudget };
   }
-  const body = {
+  const body: any = {
     contents: [{ role: 'user', parts: [{ text: prompt }] }],
     generationConfig,
   };
+  if (grounded) body.tools = [{ google_search: {} }];
   const rawText = await fetchGeminiJsonWithRetry(url, body, `Gemini text ${model}`);
   let raw: any;
   try { raw = JSON.parse(rawText); } catch { raw = { non_json_response: rawText }; }
