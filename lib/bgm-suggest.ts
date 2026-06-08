@@ -65,8 +65,14 @@ export async function suggestFamousTracks(
   if (!config.GEMINI_API_KEY) return [];
   const prompt = buildFamousBgmPrompt(profile, referenceIdentity, count);
   try {
+    // 구글 검색 그라운딩 — 응답 전 웹 검색으로 "지금" 릴스/숏폼 트렌드를 반영(학습 컷오프 한계 보완).
+    // 그라운딩은 JSON 강제 모드와 동시 사용 불가 → 텍스트에서 JSON 을 느슨 파싱한다.
     // 추천은 다양성이 있어야 하므로 temperature 를 약간 높게.
-    const r = await callGeminiTextOnly(prompt, { temperature: 0.8, maxOutputTokens: 2048 });
+    const r = await callGeminiTextOnly(prompt, {
+      temperature: 0.8,
+      maxOutputTokens: 4096,
+      groundWithSearch: true,
+    });
     const tracks = r?.parsed?.tracks;
     return normalizeTracks(tracks, count);
   } catch {
