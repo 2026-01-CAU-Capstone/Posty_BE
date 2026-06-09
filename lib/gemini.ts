@@ -27,6 +27,9 @@ export async function analyzeVideoStructured(
   filePath: string,
   prompt: string,
   model?: string,
+  // capacity(429/5xx) 폴백이 준비된 호출은 maxAttempts 를 짧게(예: 2) 줘서 Pro 재시도 백오프로
+  // 분 단위를 허비하지 않고 빨리 폴백시킨다. 미지정이면 기본 재시도 횟수(5).
+  opts?: { maxAttempts?: number },
 ): Promise<GeminiResult> {
   if (!config.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY 가 설정되지 않았습니다');
 
@@ -56,7 +59,7 @@ export async function analyzeVideoStructured(
     },
   };
 
-  const rawText = await fetchGeminiJsonWithRetry(url, body, `Gemini ${useModel}`);
+  const rawText = await fetchGeminiJsonWithRetry(url, body, `Gemini ${useModel}`, opts?.maxAttempts);
   let raw: any;
   try { raw = JSON.parse(rawText); } catch { raw = { non_json_response: rawText }; }
 
@@ -80,7 +83,7 @@ export async function analyzeMultiPartStructured(
   mediaParts: MediaPart[],
   prompt: string,
   model?: string,
-  opts?: { temperature?: number },
+  opts?: { temperature?: number; maxAttempts?: number },
 ): Promise<GeminiResult> {
   if (!config.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY 가 설정되지 않았습니다');
 
@@ -111,7 +114,7 @@ export async function analyzeMultiPartStructured(
     },
   };
 
-  const rawText = await fetchGeminiJsonWithRetry(url, body, `Gemini ${useModel} multipart`);
+  const rawText = await fetchGeminiJsonWithRetry(url, body, `Gemini ${useModel} multipart`, opts?.maxAttempts);
   let raw: any;
   try { raw = JSON.parse(rawText); } catch { raw = { non_json_response: rawText }; }
   const text = extractText(raw) ?? rawText;
@@ -252,8 +255,7 @@ export async function callGeminiTextOnly(
   return { raw, parsed };
 }
 
-async function fetchGeminiJsonWithRetry(url: string, body: any, label: string): Promise<string> {
-  const maxAttempts = 5;
+async function fetchGeminiJsonWithRetry(url: string, body: any, label: string, maxAttempts = 5): Promise<string> {
   let lastError = '';
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
