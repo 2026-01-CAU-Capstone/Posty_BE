@@ -43,7 +43,7 @@ export async function runStage0(
   shots: number;
   duration: number;
   text_focused_pass: 'ok' | 'failed' | 'skipped';
-  caption_crop_refine: 'ok' | 'failed' | 'skipped';
+  caption_crop_refine: 'ok' | 'failed' | 'skipped' | 'deferred';
   reanalyzed: boolean;
 }> {
   const refDir = referenceDir(projectId);
@@ -80,9 +80,23 @@ export async function runStage0(
     prompt = styleNoteBlock(styleNote) + REFERENCE_ANALYSIS_PROMPT;
   }
 
-  // ---- 1차: 메인 분석 (재분석 모드면 second-pass 프롬프트) ----
-  onProgress?.('stage0_main', reanalyzed ? '레퍼런스 보강 분석 중' : '레퍼런스 메인 분석 중 (컷·색·오디오·텍스트)');
-  const main = await analyzeWithProFallback(refFile, prompt, 'main');
+  // ---- 1차+2차 병렬: 메인 분석 + 텍스트 전용 추출 ----
+  // 둘 다 같은 레퍼런스 영상을 서로 다른 프롬프트로 독립 분석하는 풀영상 Pro 호출이라
+  // 순차로 돌릴 이유가 없다 → 동시에 띄워 Stage 0 에서 가장 무거운 구간을 ~절반으로 줄인다.
+  // (main 결과로 spec 을 만들고, text_focused 결과는 그 위에 머지 — 둘은 독립적.)
+  // 각 analyzeWithProFallback 은 내부에서 파일/공유상태를 건드리지 않고 결과만 반환하므로
+  // 병렬 실행이 안전하다. raw 응답 기록·spec 가공은 아래에서 순차로 처리한다.
+  onProgress?.('stage0_main', reanalyzed ? '레퍼런스 보강 분석 중' : '레퍼런스 메인+자막 분석 중 (병렬)');
+  const [mainSettled, textSettled] = await Promise.allSettled([
+    analyzeWithProFallback(refFile, prompt, 'main'),
+    analyzeWithProFallback(refFile, REFERENCE_TEXT_FOCUSED_PROMPT, 'text_focused'),
+  ]);
+
+  // main 은 필수 — 실패하면 Stage 0 자체가 실패(기존 동작 유지).
+  if (mainSettled.status !== 'fulfilled') {
+    throw mainSettled.reason instanceof Error ? mainSettled.reason : new Error(String(mainSettled.reason));
+  }
+  const main = mainSettled.value;
   const { raw, parsed } = main;
   await appendRawResponse(projectId, {
     stage: 0,
@@ -99,38 +113,31 @@ export async function runStage0(
   // caption_pattern 도 기본값 보정
   spec.caption_pattern = spec.caption_pattern || {};
 
-  // ---- 2차: 텍스트 전용 추출 (한글 인식 강화) ----
+  // ---- 텍스트 전용 추출 결과 머지 (보조 — 성공 시 머지, 실패해도 분석 유지) ----
   let textFocusedStatus: 'ok' | 'failed' | 'skipped' = 'skipped';
-  onProgress?.('stage0_text', '자막 텍스트 정밀 분석 중');
-  try {
-    const textFocused = await analyzeWithProFallback(refFile, REFERENCE_TEXT_FOCUSED_PROMPT, 'text_focused');
+  if (textSettled.status === 'fulfilled') {
+    const textFocused = textSettled.value;
     const { raw: raw2, parsed: parsed2 } = textFocused;
     await appendRawResponse(projectId, {
       stage: 0, kind: `${textFocused.kind}_video_text_focused`, response: raw2,
     });
     mergeTextFocusedIntoSpec(spec, parsed2);
     textFocusedStatus = 'ok';
-  } catch (e: any) {
+  } else {
+    const e: any = textSettled.reason;
     await appendRawResponse(projectId, {
-      stage: 0, kind: 'gemini_pro_video_text_focused_failed', error: e.message || String(e),
+      stage: 0, kind: 'gemini_pro_video_text_focused_failed', error: e?.message || String(e),
     });
     textFocusedStatus = 'failed';
   }
 
-  // ---- 2.5차: 자막 크롭 정밀분석 (zoom-in) ----
-  // 자막의 세로 위치 기준 가로 밴드를 크롭·업스케일해 다시 LLM 에 보내, 색/박스/그림자/굵기를
-  // 풀프레임보다 정확히 읽고 caption_layers 의 스타일 필드만 덮어쓴다. (실패해도 분석은 유지)
-  let captionCropStatus: 'ok' | 'failed' | 'skipped' = 'skipped';
-  onProgress?.('stage0_caption', '자막 스타일 정밀 분석 중');
-  try {
-    const refined = await refineCaptionStylesViaCrops(projectId, spec, refFile);
-    captionCropStatus = refined > 0 ? 'ok' : 'skipped';
-  } catch (e: any) {
-    captionCropStatus = 'failed';
-    await appendRawResponse(projectId, {
-      stage: 0, kind: 'caption_crop_refine_failed', error: e.message || String(e),
-    });
-  }
+  // ---- 2.5차: 자막 크롭 정밀분석 → 컷편집(Stage 1)과 병렬로 이동 ----
+  // 자막 스타일 정밀화(refineCaptionStylesViaCrops)는 Stage 0 의 가장 큰 추가 비용이었다
+  // (Flash 1 + Pro 1 비전 호출 + ffmpeg 다수). 그 결과는 Stage 3(자막)에서만 쓰이므로
+  // Stage 0 의 임계경로에서 빼고, 컷편집(Stage 1)의 무거운 소스 분석과 병렬로 돌린다.
+  // (stage1.ts 가 refineReferenceCaptionStyles 를 동시에 실행하고, 매칭 직전 완료를 기다려
+  //  갱신된 자막 스타일을 edit-plan 에 반영 → 자막 충실도는 100% 보존.)
+  const captionCropStatus: 'ok' | 'failed' | 'skipped' | 'deferred' = 'deferred';
 
   // ---- 워터마크/지속 오버레이 제거 ----
   // 출처/핸들/가게 워터마크처럼 "영상 콘텐츠가 아닌" 지속 오버레이를 spec 에서 미리 제거.
@@ -571,6 +578,37 @@ export function mergeCropStyleIntoLayer(layer: any, crop: any): void {
   if (str(crop.font_family_hint)) layer.font_family_hint = crop.font_family_hint;
   if (str(crop.font_width)) layer.font_width = String(crop.font_width).toLowerCase();
   if (str(crop.letter_spacing)) layer.letter_spacing = String(crop.letter_spacing).toLowerCase();
+}
+
+// Stage 0 에서 분리한 자막 스타일 정밀화 — 컷편집(Stage 1)과 병렬로 실행하기 위한 진입점.
+// edit-spec.json 을 읽어 caption_layers 의 "스타일" 필드만 크롭 정밀분석으로 보정하고 다시 쓴다.
+// (텍스트/위치/크기/샷 구조는 안 건드리므로 Stage 1 의 매칭/임베딩과 독립적 → 병렬 안전.)
+export async function refineReferenceCaptionStyles(
+  projectId: string,
+): Promise<{ refined: number; status: 'ok' | 'failed' | 'skipped'; spec: any | null }> {
+  if (!config.GEMINI_API_KEY) return { refined: 0, status: 'skipped', spec: null };
+  const spec: any = await readJson(ARTIFACTS.editSpec(projectId));
+  if (!spec || !Array.isArray(spec.shots) || spec.shots.length === 0) return { refined: 0, status: 'skipped', spec: spec ?? null };
+  // 이미 정밀화된 spec 이면 재실행하지 않는다 (Stage 1 재시도 시 Pro/Flash 호출 중복 방지).
+  // reanalyze 는 새 spec 을 써서 이 마커가 없으므로 자연히 다시 정밀화된다.
+  if (spec._caption_refined === true) return { refined: 0, status: 'skipped', spec };
+  const refDir = referenceDir(projectId);
+  const files = (await fs.readdir(refDir).catch(() => [])).filter(f => !f.startsWith('.'));
+  if (files.length === 0) return { refined: 0, status: 'skipped', spec };
+  const refFile = path.join(refDir, files[0]);
+  try {
+    const refined = await refineCaptionStylesViaCrops(projectId, spec, refFile);
+    spec._caption_refined = true; // "정밀화 완료" 마커 — 재실행/다른 stage 에서 중복 비용 회피.
+    await writeJson(ARTIFACTS.editSpec(projectId), spec);
+    // 갱신된 spec 객체를 그대로 돌려준다 → 호출부(Stage 1)가 디스크를 다시 읽지 않고 바로 사용
+    // (write 직후 read 가 어긋날 이론적 틈을 없앤다).
+    return { refined, status: refined > 0 ? 'ok' : 'skipped', spec };
+  } catch (e: any) {
+    await appendRawResponse(projectId, {
+      stage: 0, kind: 'caption_crop_refine_failed', error: e?.message || String(e),
+    });
+    return { refined: 0, status: 'failed', spec };
+  }
 }
 
 async function refineCaptionStylesViaCrops(projectId: string, spec: any, refFile: string): Promise<number> {
