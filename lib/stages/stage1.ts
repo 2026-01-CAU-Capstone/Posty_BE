@@ -26,6 +26,7 @@ import { briefToPromptBlock, readStyleBrief } from '../style-brief';
 import { reduceSourceShots, ReduceCandidate } from '../source-reduce';
 import { CaptionLayer, preserveLayerDesign } from '../caption-ass';
 import { readCutConfig, resolveTargetRange } from '../cut-config';
+import { refineReferenceCaptionStyles } from './stage0';
 import { config } from '../config';
 
 const OUT_W = 1080;
@@ -154,6 +155,13 @@ export async function runStage1(projectId: string): Promise<{
     .filter(f => !f.startsWith('.'));
   if (srcFiles.length === 0) throw new Error('소스 영상이 없습니다');
 
+  // ---- 자막 스타일 정밀화를 컷편집과 병렬로 시작 ----
+  // (Stage 0 에서 분리한 무거운 단계 — Flash 1 + Pro 1 비전 + ffmpeg 다수.)
+  // 컷편집의 무거운 소스 분석/임베딩이 도는 동안 백그라운드로 진행 → 사실상 시간이 숨는다.
+  // 결과(갱신된 caption_layers 스타일)는 아래 매칭 직전에 await 해서 plan 에 반영한다.
+  const captionRefineP = refineReferenceCaptionStyles(projectId)
+    .catch(() => ({ refined: 0, status: 'failed' as const, spec: null }));
+
   // ---- 1a + 1b: 각 소스에 대해 shot 검출 + Flash 묘사 ----
   const styleNote = await readStyleNote(projectId);
   const styleBlock = styleNoteBlock(styleNote);
@@ -242,6 +250,17 @@ export async function runStage1(projectId: string): Promise<{
     count: refTexts.length + srcEntries.length, model: config.OPENAI_EMBEDDING_MODEL,
   });
 
+  // ---- 자막 정밀화 완료 대기 → 갱신된 ref 자막 스타일을 plan 에 반영(충실도 보존) ----
+  // 매칭/임베딩은 caption 스타일과 무관하므로, 여기까지(무거운 소스 분석·임베딩 후) 오면
+  // 병렬 refine 가 거의 끝나 있어 추가 지연이 작다. 갱신된 caption_layers 를 가진 spec 을 다시 읽어
+  // 아래 매칭 루프의 ref_caption_layers 복사에 사용한다. (실패해도 원본 spec 으로 폴백.)
+  const captionRefine = await captionRefineP;
+  // refine 가 돌려준 갱신 spec 을 직접 사용(디스크 재읽기 불필요). 실패/스킵 시 원본 spec 폴백.
+  const refinedSpec: any = captionRefine.spec || spec;
+  await appendRawResponse(projectId, {
+    stage: 1, kind: 'caption_refine_parallel', refined: captionRefine.refined, status: captionRefine.status,
+  });
+
   // ---- 1d: 각 source shot 마다 가장 잘 어울리는 ref shot 의 STYLE 을 빌려온다 ----
   // (ref 는 재사용 OK — 스타일은 여러 source 에 적용 가능. source 는 한 번씩만 사용.)
   const plan: EditPlanItem[] = [];
@@ -260,6 +279,8 @@ export async function runStage1(projectId: string): Promise<{
       if (score > bestSim) { bestSim = score; bestRefIdx = j; }
     }
     const ref = spec.shots[bestRefIdx];
+    // 자막 스타일은 병렬 refine 로 갱신된 spec 에서 가져온다(없으면 원본 폴백).
+    const refCaptionLayers = refinedSpec.shots?.[bestRefIdx]?.caption_layers ?? ref.caption_layers;
 
     // 매칭된 ref 컷의 길이로 이 컷의 길이를 구동한다 → 레퍼런스의 빠른 템포/리듬 재현.
     // (이 ref 에서 STYLE 도 빌려오므로, 그 ref 컷의 (end-start) 가 곧 이 컷의 목표 길이.)
@@ -269,7 +290,7 @@ export async function runStage1(projectId: string): Promise<{
 
     plan.push({
       ref_index: typeof ref.index === 'number' ? ref.index : bestRefIdx,
-      ref_caption_layers: normalizeLayers(ref.caption_layers),
+      ref_caption_layers: normalizeLayers(refCaptionLayers),
       ref_transition: ref.transition_to_next || 'cut',
 
       source_video_id: e.v.video_id,
