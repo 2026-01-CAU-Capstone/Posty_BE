@@ -103,6 +103,20 @@ export function getJob(id: string): Job | undefined {
   return jobs.get(id);
 }
 
+// 같은 프로젝트의 "활성(pending/running)" 동일 stage 잡을 찾는다.
+// 프런트의 hang/error 자동 재시도가 이미 돌고 있는 Stage 0 위에 중복 잡을 쌓으면
+// (동시성 1) 같은 분석을 두세 번 반복하고 startedAt 리셋으로 진행률이 99%→2% 로
+// 떨어진다. 중복 요청은 새 잡을 만들지 않고 기존 활성 잡으로 합친다.
+export function findActiveStageJob(projectId: string, stage: number): Job | undefined {
+  for (const j of jobs.values()) {
+    if (j.type !== 'stage') continue;
+    if (j.projectId !== projectId) continue;
+    if (Number(j.params?.stage) !== stage) continue;
+    if (j.status === 'pending' || j.status === 'running') return j;
+  }
+  return undefined;
+}
+
 // 공개용 직렬화 (내부 필드 그대로지만 안전하게 복사)
 export function publicJob(job: Job) {
   return {

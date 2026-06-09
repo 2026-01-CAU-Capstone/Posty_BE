@@ -16,9 +16,14 @@ import { ARTIFACTS } from '../../lib/paths';
 const STAGE_LABEL = ['레퍼런스 분석', '컷편집', '색보정', '자막', '음성·BGM'];
 
 // stage 0 만 별도 옵션(reanalyze 등) 을 받는다. 다른 stage 는 params 없음.
-async function runStage(n: number, projectId: string, stage0Opts?: RunStage0Options): Promise<any> {
+async function runStage(
+  n: number,
+  projectId: string,
+  stage0Opts?: RunStage0Options,
+  onStage0Progress?: (step: string, msg: string) => void,
+): Promise<any> {
   switch (n) {
-    case 0: return runStage0(projectId, stage0Opts || {});
+    case 0: return runStage0(projectId, stage0Opts || {}, onStage0Progress);
     case 1: return runStage1(projectId);
     case 2: return runStage2(projectId);
     case 3: return runStage3(projectId);
@@ -50,7 +55,7 @@ export async function jobRunner(job: Job, progress: ProgressFn): Promise<any> {
     if (!Number.isInteger(n) || n < 0 || n > 4) throw new Error(`stage 파라미터가 잘못됨: ${job.params?.stage}`);
     const stage0Opts = n === 0 ? pickStage0Options(job.params) : undefined;
     progress(`stage${n}_start`, `Stage ${n} (${STAGE_LABEL[n]}) 시작`, { stage: n, ...(stage0Opts ? { reanalyze: !!stage0Opts.reanalyze } : {}) });
-    const result = await runStage(n, projectId, stage0Opts);
+    const result = await runStage(n, projectId, stage0Opts, (step, msg) => progress(step, msg, { stage: n }));
     progress(`stage${n}_done`, `Stage ${n} (${STAGE_LABEL[n]}) 완료`, { stage: n, result });
     return { stage: n, result, final: relForServe(ARTIFACTS.finalMp4(projectId)) };
   }
@@ -62,7 +67,7 @@ export async function jobRunner(job: Job, progress: ProgressFn): Promise<any> {
     for (let n = from; n <= to; n++) {
       // run_all 흐름에선 stage 0 옵션은 무시(재분석은 'stage' 모드에서만).
       progress(`stage${n}_start`, `Stage ${n} (${STAGE_LABEL[n]}) 시작`, { stage: n, from, to });
-      results[`stage${n}`] = await runStage(n, projectId);
+      results[`stage${n}`] = await runStage(n, projectId, undefined, (step, msg) => progress(step, msg, { stage: n, from, to }));
       progress(`stage${n}_done`, `Stage ${n} (${STAGE_LABEL[n]}) 완료`, { stage: n, from, to });
     }
     const reachedFinal = to >= 4;
