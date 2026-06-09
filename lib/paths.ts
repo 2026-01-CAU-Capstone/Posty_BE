@@ -120,7 +120,19 @@ export async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
-export async function appendRawResponse(projectId: string, entry: any): Promise<void> {
+// raw-api-responses.json 은 read-modify-write 라 동시 호출이 겹치면 항목 유실/손상이 난다.
+// (예: 레퍼런스 자막 정밀화를 컷편집과 병렬로 돌릴 때 양쪽이 동시에 append.)
+// 프로세스 내 단일 큐로 직렬화해 안전하게 만든다. (반환 promise 는 이 항목 기록 완료 시 resolve.)
+let rawResponseQueue: Promise<void> = Promise.resolve();
+export function appendRawResponse(projectId: string, entry: any): Promise<void> {
+  rawResponseQueue = rawResponseQueue.then(() => appendRawResponseUnlocked(projectId, entry).catch((e) => {
+    // 진단 로그라 비치명적 — 큐가 막히지 않도록 삼키되, 조용히 사라지진 않게 경고만 남긴다.
+    try { console.warn('[appendRawResponse] 기록 실패(무시):', (e && e.message) || e); } catch { /* noop */ }
+  }));
+  return rawResponseQueue;
+}
+
+async function appendRawResponseUnlocked(projectId: string, entry: any): Promise<void> {
   const p = ARTIFACTS.rawResponses(projectId);
   await ensureDir(path.dirname(p));
   let arr: any[] = [];
