@@ -34,6 +34,10 @@ export type RunStage0Options = {
 export async function runStage0(
   projectId: string,
   options: RunStage0Options = {},
+  // 단계별 진행 보고(선택). Stage 0 은 Gemini Pro 영상 호출이 길어 예전엔 start~done 사이
+  // 신호가 전혀 없었다 → 진행률 바가 시간추정만 따라가 "99%에서 멈춤"처럼 보이고,
+  // hang 감지가 "느림"과 "멈춤"을 구분 못 했다. 주요 단계마다 보고해 실제 진행을 노출한다.
+  onProgress?: (step: string, msg: string) => void,
 ): Promise<{
   ok: true;
   shots: number;
@@ -77,6 +81,7 @@ export async function runStage0(
   }
 
   // ---- 1차: 메인 분석 (재분석 모드면 second-pass 프롬프트) ----
+  onProgress?.('stage0_main', reanalyzed ? '레퍼런스 보강 분석 중' : '레퍼런스 메인 분석 중 (컷·색·오디오·텍스트)');
   const main = await analyzeWithProFallback(refFile, prompt, 'main');
   const { raw, parsed } = main;
   await appendRawResponse(projectId, {
@@ -96,6 +101,7 @@ export async function runStage0(
 
   // ---- 2차: 텍스트 전용 추출 (한글 인식 강화) ----
   let textFocusedStatus: 'ok' | 'failed' | 'skipped' = 'skipped';
+  onProgress?.('stage0_text', '자막 텍스트 정밀 분석 중');
   try {
     const textFocused = await analyzeWithProFallback(refFile, REFERENCE_TEXT_FOCUSED_PROMPT, 'text_focused');
     const { raw: raw2, parsed: parsed2 } = textFocused;
@@ -115,6 +121,7 @@ export async function runStage0(
   // 자막의 세로 위치 기준 가로 밴드를 크롭·업스케일해 다시 LLM 에 보내, 색/박스/그림자/굵기를
   // 풀프레임보다 정확히 읽고 caption_layers 의 스타일 필드만 덮어쓴다. (실패해도 분석은 유지)
   let captionCropStatus: 'ok' | 'failed' | 'skipped' = 'skipped';
+  onProgress?.('stage0_caption', '자막 스타일 정밀 분석 중');
   try {
     const refined = await refineCaptionStylesViaCrops(projectId, spec, refFile);
     captionCropStatus = refined > 0 ? 'ok' : 'skipped';
@@ -128,6 +135,7 @@ export async function runStage0(
   // ---- 워터마크/지속 오버레이 제거 ----
   // 출처/핸들/가게 워터마크처럼 "영상 콘텐츠가 아닌" 지속 오버레이를 spec 에서 미리 제거.
   // (caption planning 단계의 LLM 판단에만 맡기지 않고, 원천 차단)
+  onProgress?.('stage0_finalize', '분석 결과 정리 중');
   const wm = stripWatermarkLayers(spec);
   if (wm.removed > 0) {
     await appendRawResponse(projectId, {

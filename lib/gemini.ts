@@ -11,6 +11,17 @@ export type GeminiResult = { raw: any; parsed: any; rawText: string };
 
 const INLINE_MAX_BYTES = 18 * 1024 * 1024;
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+// Gemini 호출 타임아웃 — 긴 영상 분석은 충분히 기다리되, 응답 자체가 안 오는 stall 은 끊어
+// 재시도 대상으로 만든다. (타임아웃/네트워크 throw 를 안 잡아 잡이 죽던 게 레퍼런스 분석
+// 99%→2% 루프의 근본 원인이었다.) env 로 조정 가능 — 비정상/0/음수 값은 기본값으로 폴백.
+// (AbortSignal.timeout(NaN) 은 RangeError 를 즉시 던지므로 반드시 가드한다.)
+const envMs = (name: string, def: number): number => {
+  const t = Number(process.env[name]);
+  return Number.isFinite(t) && t > 0 ? t : def;
+};
+const GEMINI_REQUEST_TIMEOUT_MS = envMs('GEMINI_REQUEST_TIMEOUT_MS', 240_000);
+const GEMINI_UPLOAD_TIMEOUT_MS = envMs('GEMINI_UPLOAD_TIMEOUT_MS', 300_000);
+const GEMINI_POLL_TIMEOUT_MS = 30_000;
 
 export async function analyzeVideoStructured(
   filePath: string,
@@ -112,12 +123,31 @@ export async function analyzeMultiPartStructured(
 // Files API: resumable upload + ACTIVE 대기
 // ============================================================
 
+// 업로드/폴링 fetch — fetch 자체의 throw(네트워크 실패/타임아웃)만 재시도한다.
+// (HTTP 상태 코드는 호출부가 처리.) 매 시도마다 AbortSignal.timeout 을 새로 건다.
+// 이게 없으면 업로드 도중 일시적 끊김/타임아웃이 그대로 잡을 죽여(>18MB 레퍼런스 경로)
+// 본 분석 경로와 똑같이 99%→2% 루프를 유발한다.
+async function geminiFetchWithRetry(url: string, init: any, timeoutMs: number, label: string, attempts = 3): Promise<any> {
+  let lastError = '';
+  for (let a = 1; a <= attempts; a++) {
+    try {
+      return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    } catch (e: any) {
+      const isTimeout = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+      lastError = `${label} ${isTimeout ? `타임아웃(${timeoutMs}ms 초과)` : '네트워크 실패'}: ${(e?.message || String(e)).slice(0, 200)}`;
+      if (a === attempts) throw new Error(lastError);
+      await sleep(retryDelayMs(a, null));
+    }
+  }
+  throw new Error(lastError);
+}
+
 async function uploadFile(filePath: string, mimeType: string): Promise<{ uri: string; name: string }> {
   const buf = await fs.readFile(filePath);
   const displayName = path.basename(filePath);
 
   // 1) start upload session
-  const startRes = await fetch(`${config.GEMINI_API_BASE}/upload/v1beta/files`, {
+  const startRes = await geminiFetchWithRetry(`${config.GEMINI_API_BASE}/upload/v1beta/files`, {
     method: 'POST',
     headers: {
       'x-goog-api-key': config.GEMINI_API_KEY,
@@ -128,16 +158,16 @@ async function uploadFile(filePath: string, mimeType: string): Promise<{ uri: st
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ file: { display_name: displayName } }),
-  });
+  }, GEMINI_POLL_TIMEOUT_MS, 'Files API start');
   if (!startRes.ok) {
-    const t = await startRes.text();
+    const t = await startRes.text().catch(() => '');
     throw new Error(`Files API start ${startRes.status}: ${t.slice(0, 400)}`);
   }
   const uploadUrl = startRes.headers.get('x-goog-upload-url') || startRes.headers.get('X-Goog-Upload-URL');
   if (!uploadUrl) throw new Error('Files API: upload URL 헤더 없음');
 
   // 2) upload + finalize
-  const upRes = await fetch(uploadUrl, {
+  const upRes = await geminiFetchWithRetry(uploadUrl, {
     method: 'POST',
     headers: {
       'Content-Length': String(buf.length),
@@ -145,9 +175,9 @@ async function uploadFile(filePath: string, mimeType: string): Promise<{ uri: st
       'X-Goog-Upload-Command': 'upload, finalize',
     },
     body: buf,
-  });
+  }, GEMINI_UPLOAD_TIMEOUT_MS, 'Files API upload');
   if (!upRes.ok) {
-    const t = await upRes.text();
+    const t = await upRes.text().catch(() => '');
     throw new Error(`Files API upload ${upRes.status}: ${t.slice(0, 400)}`);
   }
   const upJson: any = await upRes.json().catch(() => ({}));
@@ -165,11 +195,11 @@ async function uploadFile(filePath: string, mimeType: string): Promise<{ uri: st
     if (state === 'FAILED') throw new Error(`Files API: 파일 처리 실패 (${file.name})`);
     if (Date.now() - start > maxWaitMs) throw new Error(`Files API: 5분 안에 ACTIVE 안 됨 (${file.name})`);
     await sleep(2000);
-    const r = await fetch(`${config.GEMINI_API_BASE}/v1beta/${file.name}`, {
+    const r = await geminiFetchWithRetry(`${config.GEMINI_API_BASE}/v1beta/${file.name}`, {
       headers: { 'x-goog-api-key': config.GEMINI_API_KEY },
-    });
+    }, GEMINI_POLL_TIMEOUT_MS, 'Files API state');
     if (!r.ok) throw new Error(`Files API state ${r.status}`);
-    const j: any = await r.json();
+    const j: any = await r.json().catch(() => ({}));
     state = j?.state ?? state;
     uri = j?.uri ?? uri;
   }
@@ -223,16 +253,34 @@ export async function callGeminiTextOnly(
 }
 
 async function fetchGeminiJsonWithRetry(url: string, body: any, label: string): Promise<string> {
-  const maxAttempts = 4;
+  const maxAttempts = 5;
   let lastError = '';
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': config.GEMINI_API_KEY },
-      body: JSON.stringify(body),
-    });
-    const rawText = await res.text();
+    let res: any;
+    let rawText = '';
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': config.GEMINI_API_KEY },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(GEMINI_REQUEST_TIMEOUT_MS),
+      });
+      // 본문 읽기도 try 안에서 — 타임아웃은 헤더 도착 후 "본문 스트리밍 중"에도 발동한다.
+      // (fetch 는 헤더만 와도 resolve 되므로, res.text() 중 끊기면 TimeoutError 가 여기서 난다.
+      //  이걸 try 밖에 두면 잡이 죽어 99%→2% 루프가 되살아난다 → 반드시 안에서 잡는다.)
+      rawText = await res.text();
+    } catch (e: any) {
+      // 던져진 fetch/본문 예외 = 네트워크 실패("fetch failed") 또는 타임아웃(TimeoutError).
+      // HTTP 에러 응답이 아니라 "응답 자체가 없는" 경우다. 잡을 죽이지 말고 재시도한다.
+      // (긴 레퍼런스 분석 호출이 중간에 throw → 잡 error → 프런트 재시도로 99%→2% 가
+      //  반복되던 근본 원인. 이제 백엔드에서 흡수해 한 번의 일시적 끊김으로 전체 분석을 안 버린다.)
+      const isTimeout = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+      lastError = `${label} ${isTimeout ? `타임아웃(${GEMINI_REQUEST_TIMEOUT_MS}ms 초과)` : '네트워크 실패'}: ${(e?.message || String(e)).slice(0, 300)}`;
+      if (attempt === maxAttempts) throw new Error(lastError);
+      await sleep(retryDelayMs(attempt, null));
+      continue;
+    }
     if (res.ok) return rawText;
 
     lastError = `${label} ${res.status}: ${rawText.slice(0, 800)}`;

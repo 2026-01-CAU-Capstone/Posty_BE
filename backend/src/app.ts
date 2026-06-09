@@ -30,7 +30,7 @@ import { DEFAULT_AUDIO_CONFIG, readAudioConfig, writeAudioConfig } from '../../l
 import { DEFAULT_CUT_CONFIG, writeCutConfig } from '../../lib/cut-config';
 import { ensureIgFetchAlive, importInstagramUrl } from '../../lib/ig-fetch';
 
-import { createJob, getJob, publicJob, setRunner } from './queue';
+import { createJob, findActiveStageJob, getJob, publicJob, setRunner } from './queue';
 import { jobRunner } from './pipeline';
 import { estimateProject } from './estimate';
 
@@ -250,6 +250,13 @@ app.post('/api/run', async (c) => {
       if (typeof body.userFocus === 'string' && body.userFocus.trim()) {
         params.userFocus = body.userFocus.trim().slice(0, 1000);
       }
+    }
+    // 중복 방지 — 같은 stage 가 이미 돌고 있으면(프런트 hang/error 재시도 등) 새로 만들지 않고
+    // 기존 활성 잡을 돌려준다. 동시성 1 에서 중복 잡이 같은 분석을 반복하고 진행률을 리셋하는 걸 막는다.
+    // (명시적 재분석 reanalyze 는 새 실행을 의도하므로 예외.)
+    if (!params.reanalyze) {
+      const existing = findActiveStageJob(projectId, stage);
+      if (existing) return c.json({ ok: true, jobId: existing.id, deduped: true });
     }
     const job = createJob('stage', projectId, params);
     return c.json({ ok: true, jobId: job.id });
