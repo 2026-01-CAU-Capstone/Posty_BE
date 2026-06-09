@@ -80,16 +80,18 @@ export async function runStage0(
     prompt = styleNoteBlock(styleNote) + REFERENCE_ANALYSIS_PROMPT;
   }
 
-  // ---- 1차+2차 병렬: 메인 분석 + 텍스트 전용 추출 ----
-  // 둘 다 같은 레퍼런스 영상을 서로 다른 프롬프트로 독립 분석하는 풀영상 Pro 호출이라
-  // 순차로 돌릴 이유가 없다 → 동시에 띄워 Stage 0 에서 가장 무거운 구간을 ~절반으로 줄인다.
+  // ---- 1차+2차 병렬: 메인 분석(Pro) ∥ 텍스트 전용 OCR(Flash) ----
+  // 예전엔 둘 다 풀영상 Pro 였는데, 같은 Pro quota 를 동시에 때려 429 충돌 → 백오프로 도로
+  // 직렬화되며 재시도 비용만 순증해 오히려 더 느렸다(2분 → 6분+ 미완성).
+  // 이제 모델을 분리한다:
+  //   · main         : Pro(정확도 우선). capacity 면 2회만에 끊고 Flash 로 빠르게 폴백.(analyzeWithProFallback)
+  //   · text_focused : 한글 OCR/텍스트 추출 패스라 Flash(3.5)로 충분 → Pro quota 와 안 다퉈 '진짜' 병렬.
   // (main 결과로 spec 을 만들고, text_focused 결과는 그 위에 머지 — 둘은 독립적.)
-  // 각 analyzeWithProFallback 은 내부에서 파일/공유상태를 건드리지 않고 결과만 반환하므로
-  // 병렬 실행이 안전하다. raw 응답 기록·spec 가공은 아래에서 순차로 처리한다.
-  onProgress?.('stage0_main', reanalyzed ? '레퍼런스 보강 분석 중' : '레퍼런스 메인+자막 분석 중 (병렬)');
+  // 두 호출 모두 파일/공유상태를 안 건드리고 결과만 반환하므로 병렬이 안전하다.
+  onProgress?.('stage0_main', reanalyzed ? '레퍼런스 보강 분석 중' : '레퍼런스 메인(Pro)+자막(Flash) 분석 중 (병렬)');
   const [mainSettled, textSettled] = await Promise.allSettled([
-    analyzeWithProFallback(refFile, prompt, 'main'),
-    analyzeWithProFallback(refFile, REFERENCE_TEXT_FOCUSED_PROMPT, 'text_focused'),
+    analyzeWithProFallback(refFile, prompt, 'main', onProgress),
+    analyzeWithFlashOnly(refFile, REFERENCE_TEXT_FOCUSED_PROMPT, 'text_focused', onProgress),
   ]);
 
   // main 은 필수 — 실패하면 Stage 0 자체가 실패(기존 동작 유지).
@@ -253,32 +255,79 @@ function isWatermarkLayer(l: any, count: number, totalShots: number): boolean {
   return false;
 }
 
+type LogFn = (step: string, msg: string) => void;
+
+// Pro 우선 호출 + capacity(429/5xx) 시 Flash(3.5) 폴백.
+// (B) Pro 재시도를 짧게(2회)로 끊는다 — capacity 면 어차피 폴백할 거라 Pro 백오프로 분 단위를
+//     허비하는 게 손해다. 2회 안에 capacity 에러가 나면 곧바로 Flash 로 내려간다.
+//     Flash 폴백은 최후 수단이라 기본 재시도(5)를 그대로 둬 견고성을 유지한다.
 async function analyzeWithProFallback(
   refFile: string,
   prompt: string,
   pass: 'main' | 'text_focused',
+  onProgress?: LogFn,
 ): Promise<{ raw: any; parsed: any; kind: 'gemini_pro' | 'gemini_flash_fallback' }> {
   try {
-    const result = await analyzeVideoStructured(refFile, prompt, config.GEMINI_PRO_MODEL);
+    const result = await analyzeVideoStructured(refFile, prompt, config.GEMINI_PRO_MODEL, { maxAttempts: 2 });
     return { ...result, kind: 'gemini_pro' };
   } catch (e: any) {
     const message = e.message || String(e);
-    if (!isRetryExhaustedCapacityError(message)) throw e;
+    if (!isRetryExhaustedCapacityError(message)) {
+      // capacity 가 아닌 에러(잘못된 키/요청 등) → 폴백 의미 없음. 실패를 로그로 노출 후 throw.
+      logApiFailure(`${pass} ${config.GEMINI_PRO_MODEL} 호출 실패`, message, onProgress);
+      throw e;
+    }
+    logFallback(pass, config.GEMINI_PRO_MODEL, config.GEMINI_FLASH_MODEL, message, onProgress);
+    try {
+      const result = await analyzeVideoStructured(refFile, prompt, config.GEMINI_FLASH_MODEL);
+      return {
+        ...result,
+        kind: 'gemini_flash_fallback',
+        raw: {
+          fallback_reason: `${pass}: ${message.slice(0, 500)}`,
+          response: result.raw,
+        },
+      };
+    } catch (e2: any) {
+      logApiFailure(`${pass} ${config.GEMINI_FLASH_MODEL} 폴백도 실패`, e2?.message || String(e2), onProgress);
+      throw e2;
+    }
+  }
+}
 
+// (A) Flash(3.5) 전용 호출 — text_focused 처럼 Pro 가 굳이 필요 없는 OCR/텍스트 패스용.
+// Pro quota 를 안 건드려 main(Pro)과 진짜 병렬이 된다. 실패하면 로그로 노출 후 throw
+// (text_focused 의 실패는 호출부에서 흡수해 분석을 계속한다).
+async function analyzeWithFlashOnly(
+  refFile: string,
+  prompt: string,
+  pass: 'main' | 'text_focused',
+  onProgress?: LogFn,
+): Promise<{ raw: any; parsed: any; kind: 'gemini_flash' }> {
+  try {
     const result = await analyzeVideoStructured(refFile, prompt, config.GEMINI_FLASH_MODEL);
-    return {
-      ...result,
-      kind: 'gemini_flash_fallback',
-      raw: {
-        fallback_reason: `${pass}: ${message.slice(0, 500)}`,
-        response: result.raw,
-      },
-    };
+    return { ...result, kind: 'gemini_flash' };
+  } catch (e: any) {
+    logApiFailure(`${pass} ${config.GEMINI_FLASH_MODEL} 호출 실패`, e?.message || String(e), onProgress);
+    throw e;
   }
 }
 
 function isRetryExhaustedCapacityError(message: string): boolean {
   return /Gemini .* (429|500|502|503|504):/.test(message);
+}
+
+// ── API 호출 실패/폴백 로그 — 백엔드 콘솔(터미널) + 잡 progress 양쪽에 노출 ──
+// "왜 느린지/왜 실패했는지"가 raw json 에만 묻히지 않고 실행 중에 바로 보이게 한다.
+// (progress 에 찍으면 프런트의 stall 타이머도 갱신돼 진행 중임이 드러난다.)
+function logFallback(pass: string, from: string, to: string, reason: string, onProgress?: LogFn): void {
+  console.warn(`[stage0] ${pass}: ${from} capacity/오류 → ${to} 폴백 — ${reason.slice(0, 180)}`);
+  onProgress?.('stage0_fallback', `${pass}: ${from} → ${to} 폴백`);
+}
+
+function logApiFailure(what: string, reason: string, onProgress?: LogFn): void {
+  console.error(`[stage0] API 호출 실패 — ${what}: ${reason.slice(0, 220)}`);
+  onProgress?.('stage0_api_error', `API 호출 실패: ${what}`);
 }
 
 // ============================================================
@@ -679,10 +728,12 @@ async function refineCaptionStylesViaCrops(projectId: string, spec: any, refFile
   // ── Phase 2: 크롭 정밀 스타일 분석 (확대 이미지 → 색/박스/그림자/굵기/폰트). Pro 우선. ──
   let parsed: any;
   try {
-    const r = await analyzeMultiPartStructured(cropParts, buildCaptionCropAnalysisPrompt(promptCrops), config.GEMINI_PRO_MODEL);
+    // (B) crop Pro 호출도 capacity 면 2회만에 끊고 곧바로 Flash 로 폴백.
+    const r = await analyzeMultiPartStructured(cropParts, buildCaptionCropAnalysisPrompt(promptCrops), config.GEMINI_PRO_MODEL, { maxAttempts: 2 });
     parsed = r.parsed;
     await appendRawResponse(projectId, { stage: 0, kind: 'gemini_pro_caption_crop', crops: cropParts.length, localized, response: r.raw });
   } catch (e: any) {
+    console.warn(`[stage0] caption_crop: ${config.GEMINI_PRO_MODEL} capacity/오류 → ${config.GEMINI_FLASH_MODEL} 폴백 — ${(e?.message || String(e)).slice(0, 160)}`);
     const r = await analyzeMultiPartStructured(cropParts, buildCaptionCropAnalysisPrompt(promptCrops), config.GEMINI_FLASH_MODEL);
     parsed = r.parsed;
     await appendRawResponse(projectId, { stage: 0, kind: 'gemini_flash_caption_crop_fallback', crops: cropParts.length, localized, fallback_reason: (e?.message || String(e)).slice(0, 300), response: r.raw });
