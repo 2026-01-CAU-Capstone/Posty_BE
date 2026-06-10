@@ -28,6 +28,7 @@ export type FamousTrack = {
   preview_url?: string;     // 30초 미리듣기 (m4a) — UI 에서 바로 들어볼 수 있음
   artwork?: string;         // 앨범 아트 썸네일
   verified?: boolean;       // iTunes 에서 실존 확인됨 (환각 아님)
+  duration_sec?: number;    // 곡 전체 길이(초) — iTunes trackTimeMillis. '정확한 초수' 표시용.
 };
 
 function searchLinks(title: string, artist: string): { spotify_url: string; youtube_url: string } {
@@ -68,7 +69,7 @@ function normalizeTracks(arr: any[], max: number): FamousTrack[] {
 // ============================================================
 type ItunesMatch = {
   title: string; artist: string; year?: string; genre?: string;
-  apple_url?: string; preview_url?: string; artwork?: string;
+  apple_url?: string; preview_url?: string; artwork?: string; duration_sec?: number;
 };
 
 function normName(s: string): string {
@@ -104,6 +105,7 @@ async function itunesLookup(title: string, artist: string): Promise<ItunesMatch 
       apple_url: best.trackViewUrl ? String(best.trackViewUrl) : undefined,
       preview_url: best.previewUrl ? String(best.previewUrl) : undefined,
       artwork: best.artworkUrl100 ? String(best.artworkUrl100) : undefined,
+      duration_sec: Number.isFinite(best.trackTimeMillis) ? Math.round(Number(best.trackTimeMillis) / 1000) : undefined,
     };
   } catch {
     return null;
@@ -146,6 +148,7 @@ export async function suggestFamousTracks(
       apple_url: m.apple_url,
       preview_url: m.preview_url,
       artwork: m.artwork,
+      duration_sec: m.duration_sec,
       ...searchLinks(m.title, m.artist),   // 정확한 이름으로 검색 링크 재구성
       verified: true,
     };

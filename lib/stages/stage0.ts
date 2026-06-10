@@ -88,7 +88,10 @@ export async function runStage0(
   //   · text_focused : 한글 OCR/텍스트 추출 패스라 Flash(3.5)로 충분 → Pro quota 와 안 다퉈 '진짜' 병렬.
   // (main 결과로 spec 을 만들고, text_focused 결과는 그 위에 머지 — 둘은 독립적.)
   // 두 호출 모두 파일/공유상태를 안 건드리고 결과만 반환하므로 병렬이 안전하다.
-  onProgress?.('stage0_main', reanalyzed ? '레퍼런스 보강 분석 중' : '레퍼런스 메인(Pro)+자막(Flash) 분석 중 (병렬)');
+  // 사용자 화면(잡 progress)엔 구현 디테일(Pro/Flash/병렬) 없이 중립 문구만 노출하고,
+  // 기술 상세는 console(디버그 전용)로만 남긴다.
+  if (!reanalyzed) console.log('[stage0] 분석 시작 — main(Pro) ∥ text_focused(Flash) 병렬');
+  onProgress?.('stage0_main', reanalyzed ? '레퍼런스 보강 분석 중' : '레퍼런스 영상 분석 중');
   const [mainSettled, textSettled] = await Promise.allSettled([
     analyzeWithProFallback(refFile, prompt, 'main', onProgress),
     analyzeWithFlashOnly(refFile, REFERENCE_TEXT_FOCUSED_PROMPT, 'text_focused', onProgress),
@@ -321,13 +324,14 @@ function isRetryExhaustedCapacityError(message: string): boolean {
 // "왜 느린지/왜 실패했는지"가 raw json 에만 묻히지 않고 실행 중에 바로 보이게 한다.
 // (progress 에 찍으면 프런트의 stall 타이머도 갱신돼 진행 중임이 드러난다.)
 function logFallback(pass: string, from: string, to: string, reason: string, onProgress?: LogFn): void {
+  // 기술 상세(모델명/사유)는 console(디버그 전용)로만. 사용자 progress 엔 중립 문구.
   console.warn(`[stage0] ${pass}: ${from} capacity/오류 → ${to} 폴백 — ${reason.slice(0, 180)}`);
-  onProgress?.('stage0_fallback', `${pass}: ${from} → ${to} 폴백`);
+  onProgress?.('stage0_fallback', '일시적으로 느려 대체 경로로 분석 중');
 }
 
 function logApiFailure(what: string, reason: string, onProgress?: LogFn): void {
   console.error(`[stage0] API 호출 실패 — ${what}: ${reason.slice(0, 220)}`);
-  onProgress?.('stage0_api_error', `API 호출 실패: ${what}`);
+  onProgress?.('stage0_api_error', '분석 중 일시적 오류 — 다시 시도 중');
 }
 
 // ============================================================
@@ -627,6 +631,15 @@ export function mergeCropStyleIntoLayer(layer: any, crop: any): void {
   if (str(crop.font_family_hint)) layer.font_family_hint = crop.font_family_hint;
   if (str(crop.font_width)) layer.font_width = String(crop.font_width).toLowerCase();
   if (str(crop.letter_spacing)) layer.letter_spacing = String(crop.letter_spacing).toLowerCase();
+
+  // 정밀 수치 필드(크롭 확대분석이 더 정확하므로 number 우선 덮어쓰기). enum 과 공존 가능 — 렌더의
+  // resolve* 헬퍼가 number 를 우선한다.
+  if (num(crop.outline_ratio) !== undefined) layer.outline_ratio = Number(crop.outline_ratio);
+  if (num(crop.font_weight) !== undefined) layer.font_weight = Number(crop.font_weight);
+  if (num(crop.font_width_ratio) !== undefined) layer.font_width_ratio = Number(crop.font_width_ratio);
+  if (num(crop.letter_spacing_em) !== undefined) layer.letter_spacing_em = Number(crop.letter_spacing_em);
+  if (num(crop.shadow_offset_x) !== undefined) layer.shadow_offset_x = Number(crop.shadow_offset_x);
+  if (num(crop.shadow_offset_y) !== undefined) layer.shadow_offset_y = Number(crop.shadow_offset_y);
 }
 
 // Stage 0 에서 분리한 자막 스타일 정밀화 — 컷편집(Stage 1)과 병렬로 실행하기 위한 진입점.

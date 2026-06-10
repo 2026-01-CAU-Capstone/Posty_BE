@@ -186,31 +186,49 @@ function familyFromHint(hint?: string): string | null {
   return null;
 }
 
+// 굵기(weight) 보정용 — ASS Bold 는 on/off 뿐이라 '실제 굵기 차등'은 폰트 선택으로 반영한다.
+// 매우 굵은 자막(black류)은 두꺼운 번들 폰트를, 가는 자막은 가벼운 산세리프를 우선한다.
+// 단 hint 가 풀리면(원본 폰트 매칭) 그게 최우선이라 여기까지 오지 않는다(스타일 카테고리 보존).
+const HEAVY_FONTS = new Set<string>([F.BlackHanSans, F.DoHyeon, F.Jua]);
+const LIGHT_FONTS = new Set<string>([F.Pretendard, F.GothicA1, F.Sunflower, F.GowunDodum, F.NanumGothic]);
+
 export function pickBundledFont(args: {
   category?: string;
   personality?: string;
   emphasis?: string;        // (미사용) — 폰트 간 우선순위를 두지 않으므로 emphasis 로 폰트를 바꾸지 않는다.
   familyHint?: string;      // 레퍼런스 폰트 이름 추정 — 번들/별칭에 매칭되면 무조건 이걸 사용(원본 폰트 그대로).
-  weightHint?: string;      // (미사용) — 위와 동일. heavy 승급 휴리스틱 제거.
+  weightHint?: string;      // (보조) thin~black 인상. weight 미지정 시 폴백으로 환산해 사용.
+  weight?: number;          // 정밀 굵기 100~900(OpenType wght). 풀 안에서 굵기 맞는 폰트를 고르는 데 사용.
 }): string {
   const cat = (args.category || 'sans').toLowerCase();
   const per = (args.personality || '').toLowerCase();
 
   // ─────────────────────────────────────────────────────
-  // 0) 원본과 같은 폰트로 맞추기 (최우선이자 사실상 유일한 기준).
-  //    font_family_hint(레퍼런스에서 추정한 실제 폰트)이 번들/별칭과 매칭되면 무조건 그 폰트로 렌더한다.
-  //    폰트 간 우선순위·emphasis/weight 기반 heavy 승급 같은 휴리스틱은 두지 않는다 —
-  //    "레퍼런스 폰트를 그대로 따라가는 것" 이 목적이므로, 우리가 임의로 다른 폰트를 끼워넣지 않는다.
+  // 0) 원본과 같은 폰트로 맞추기 (최우선). font_family_hint 가 번들/별칭과 매칭되면 그대로 사용.
   // ─────────────────────────────────────────────────────
   const hinted = familyFromHint(args.familyHint);
   if (hinted) return hinted;
 
-  // 1) hint 가 없거나 못 풀 때만 — (category, personality) 의 대표 폰트로 결정적 폴백.
-  //    같은 (category, personality) 면 항상 같은 폰트 → 영상 내 일관성. (heavy 승급 없음)
+  // 1) hint 가 없거나 못 풀 때 — (category, personality) 의 대표 폰트 풀로 결정적 폴백.
   let pool: string[] | undefined;
   if (per) pool = BY_COMBO[`${cat}/${per}`];                     // (category, personality) 정확 매칭
   if (!pool || pool.length === 0) pool = per ? BY_PERSONALITY[per] : undefined; // personality 단독
   if (!pool || pool.length === 0) pool = BY_CATEGORY[cat];       // category 단독
   if (!pool || pool.length === 0) pool = [F.Pretendard];         // 최후 폴백
+
+  // 2) 굵기 보정 — 풀 '안에서만' 무게에 맞는 폰트를 고른다(스타일 카테고리는 깨지 않음).
+  //    weight 우선, 없으면 weightHint(black/thin 등) 환산.
+  const weight = Number.isFinite(args.weight as number)
+    ? Number(args.weight)
+    : ({ thin: 100, light: 300, regular: 400, medium: 500, bold: 700, black: 900 } as Record<string, number>)[(args.weightHint || '').toLowerCase()];
+  if (Number.isFinite(weight)) {
+    if ((weight as number) >= 800) {
+      const heavy = pool.find(f => HEAVY_FONTS.has(f));
+      if (heavy) return heavy;
+    } else if ((weight as number) <= 200) {
+      const light = pool.find(f => LIGHT_FONTS.has(f));
+      if (light) return light;
+    }
+  }
   return pool[0];
 }

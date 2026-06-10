@@ -151,18 +151,23 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
           "font_category": "sans" | "serif" | "handwritten" | "condensed" | "rounded" | "display",
           "font_personality": "modern" | "vintage" | "playful" | "elegant" | "bold_impact" | "minimal" | "retro" | "handwritten_neat" | "handwritten_brush" | "display_decorative",
           "font_family_hint": string,            // 글자 모양 재현용 — 폰트 이름이 떠오르면 추정 (예: "Black Han Sans", "Pretendard", "BM Hanna", "G마켓 산스"). 모르면 "".
-          "font_width": "normal" | "condensed" | "expanded",            // 자폭: 좁고 길쭉하면 condensed, 넓으면 expanded, 보통은 normal.
-          "font_weight_hint": "thin" | "light" | "regular" | "medium" | "bold" | "black",   // 굵기 인상 (아주 두꺼우면 black).
+          "font_width": "normal" | "condensed" | "expanded",            // 자폭(거친 단계). 보통은 normal.
+          "font_width_ratio": number,            // 정밀 자폭 = 가로 폭 비율 %(100=기본, 좁고 길쭉=80~90, 넓음=110~130). 4단계로 뭉개지 말고 숫자로. 모르면 100. font_width 보다 우선.
+          "font_weight_hint": "thin" | "light" | "regular" | "medium" | "bold" | "black",   // 굵기 인상(거친 단계).
+          "font_weight": number,                 // 정밀 굵기 100~900(OpenType wght): thin100 light300 regular400 medium500 bold700 black900(매우 두꺼움). 4단계로 뭉개지 말고 숫자로 — font_weight_hint/emphasis 보다 우선.
           "font_style_notes": string,            // 자유 서술 (예: "둥근 고딕", "각진 헤드라인", "약간 손글씨"). 모르면 "".
           "role": "hook" | "fact" | "punchline" | "question" | "cta" | "quote" | "label" | "emphasis" | "decoration",
           "tone": "casual" | "formal" | "hype" | "poetic" | "informational" | "humorous" | "emotional",
 
           "outline_color_hex": string,           // 글자 외곽선 색. 외곽선 없으면 ""
-          "outline_thickness": "none" | "thin" | "medium" | "thick",
+          "outline_thickness": "none" | "thin" | "medium" | "thick",   // (거친 단계)
+          "outline_ratio": number,               // 정밀 외곽선 두께 = 외곽선 두께 ÷ 글자높이(0~0.15, 0=없음). 4단계로 뭉개지 말고 숫자로. outline_thickness 보다 우선.
 
           "has_shadow": boolean,                 // 글자에 그림자가 보이면 true
           "shadow_color_hex": string,            // 그림자 색. 보통 "#000000"
-          "shadow_blur": number,                 // 0~30. 그림자 흐림 정도. 또렷한 그림자면 0~3, 부드러운 글로우형이면 8~20
+          "shadow_blur": number,                 // 0~24. 그림자 흐림 반경(px, 화면높이 1920 기준). 또렷한 그림자=0~3, 부드러운 글로우형=8~20
+          "shadow_offset_x": number,             // 그림자 가로 오프셋 px(오른쪽+ / 왼쪽-). 보통 0~6. 없으면 0.
+          "shadow_offset_y": number,             // 그림자 세로 오프셋 px(아래+ / 위-). 보통 2~6. 없으면 4.
 
           "has_background_box": boolean,         // 글자 뒤에 박스/박스형 배경이 있으면 true
           "background_color_hex": string,        // 박스 색 (있을 때)
@@ -179,9 +184,10 @@ export const REFERENCE_ANALYSIS_PROMPT = `너는 숏폼(릴스/틱톡) 편집 �
 
           "has_glow": boolean,                   // 글자 주변에 빛나는 광이 보이면 true (네온/글로우 효과)
           "glow_color_hex": string,              // 광 색. 보통 글자 색과 같거나 살짝 다른 색.
-          "glow_radius": number,                 // 5~30. 광의 퍼짐 정도
+          "glow_radius": number,                 // 0~28. 광(헤일로) 퍼짐 반경 px(화면높이 1920 기준). 0=글로우 없음.
 
-          "letter_spacing": "tight" | "normal" | "wide",   // 자간. 일반은 normal.
+          "letter_spacing": "tight" | "normal" | "wide",   // 자간(거친 단계).
+          "letter_spacing_em": number,           // 정밀 자간 em(-0.05~0.15): 좁으면 음수(-0.02), 넓으면 양수(0.06). 모르면 0. letter_spacing 보다 우선.
 
           "entry_animation": "none" | "fade"     // 자막 등장 방식. 갑작스럽게 나타나면 none, 부드럽게 페이드인이면 fade. 확실치 않으면 fade.
         }
@@ -579,20 +585,26 @@ ${list}
       "color_runs": [ { "text": string, "color_hex": string } ],
       "emphasis": "regular" | "bold" | "black",
       "font_weight_hint": "thin" | "light" | "regular" | "medium" | "bold" | "black",
+      "font_weight": number,                 // 정밀 굵기 100~900(thin100 light300 regular400 medium500 bold700 black900). 확대 이미지로 정직하게 숫자로. font_weight_hint 보다 우선.
       "font_family_hint": string,
       "font_width": "normal" | "condensed" | "expanded",
+      "font_width_ratio": number,            // 정밀 자폭 %(100=기본, 좁음 80~90, 넓음 110~130). 모르면 100.
       "outline_color_hex": string,
       "outline_thickness": "none" | "thin" | "medium" | "thick",
+      "outline_ratio": number,               // 정밀 외곽선 두께 ÷ 글자높이(0~0.15, 0=없음). 4단계로 뭉개지 말고 숫자로. outline_thickness 보다 우선.
       "has_shadow": boolean,
       "shadow_color_hex": string,
-      "shadow_blur": number,
+      "shadow_blur": number,                 // 0~24. 그림자 흐림 반경 px.
+      "shadow_offset_x": number,             // 그림자 가로 오프셋 px(오른쪽+/왼쪽-). 없으면 0.
+      "shadow_offset_y": number,             // 그림자 세로 오프셋 px(아래+/위-). 없으면 4.
       "has_background_box": boolean,
       "background_color_hex": string,
       "background_alpha": number,
       "has_glow": boolean,
       "glow_color_hex": string,
-      "glow_radius": number,
-      "letter_spacing": "tight" | "normal" | "wide"
+      "glow_radius": number,                 // 0~28. 광 퍼짐 반경 px. 0=글로우 없음.
+      "letter_spacing": "tight" | "normal" | "wide",
+      "letter_spacing_em": number            // 정밀 자간 em(-0.05~0.15). 좁으면 음수, 넓으면 양수. 모르면 0. letter_spacing 보다 우선.
     }
   ]
 }`;
@@ -753,7 +765,7 @@ ref 텍스트가 사용자 영상 맥락에도 그대로 들어맞으면 **변�
 - 반복 구조 템플릿: ${(args.refPattern?.recurring_structures || []).join(' / ') || '(없음)'}
 - 치환 슬롯 힌트: ${(args.refPattern?.subject_substitution_hints || []).join(' / ') || '(없음)'}
 - 빈도: ${args.refPattern?.frequency || '?'}  ← 이 빈도를 정확히 따라가라
-- 평균/최대 글자수: ${args.refPattern?.average_char_count || '?'} / ${args.refPattern?.max_char_count || '?'}
+- 평균/최대 글자수: ${args.refPattern?.average_char_count || '?'} / ${args.refPattern?.max_char_count || '?'}  ← 각 layer text 글자수를 이 범위에 맞춰라(특히 max 를 넘기지 마라). 넘칠 것 같으면 size 를 낮추지 말고 문구를 더 짧게 써라.
 - 사이즈 대비: ${args.refPattern?.size_contrast || '?'} (uniform=일정, dramatic=극단적)
 - 동시 layer 수: ${args.refPattern?.layer_count_typical || 1}
 - 폰트 다양성: ${args.refPattern?.font_variety || 'single'} (dual = 두 종류 섞임)
@@ -800,8 +812,10 @@ ${args.groundedFrames ? '⚠ 각 cut 의 **실제 편집본 화면 프레임이 
    - 컷의 matched_ref_layers 의 size_level 을 layer 순서대로 그대로 사용해라 (small/medium/large/huge).
    - **size_ratio (정밀 크기, 글자 높이÷영상 높이) 도 matched_ref_layers 의 값을 그대로 복사.** ref layer 에 size_ratio 가 있으면 그 숫자를 그대로, size_level 과 일관되게(small≈0.03/medium≈0.05/large≈0.07/huge≈0.10).
    - "텍스트가 길어서 작아져야 할 것 같다" 같은 추측으로 임의로 small 로 떨어뜨리지 마라.
-     렌더 단계에서 width fit 이 알아서 폰트를 줄인다. **너의 일은 ref 의 "사이즈 위계" 를 그대로 옮기는 것.**
-   - 예: ref 의 huge 자막이 사용자 컷에서도 huge 여야 한다 (글자 수 무관). large 면 large, medium 이면 medium.
+     **너의 일은 ref 의 "사이즈 위계" 를 그대로 옮기는 것** — size 는 ref 그대로 두고, 길이는 "문구를 짧게" 써서 맞춘다.
+   - **길이는 size 축소가 아니라 문구로 맞춘다:** 한 layer 가 ref 글자수(특히 max_char_count)를 넘기면 size 를 낮추지 말고, 슬롯 치환은 유지하되 수식어/조사를 줄여 더 짧게 다시 써라.
+   - size 단계별 권장 글자수(한 줄 기준, 넘으면 문구를 줄여라): huge ≤ 6자, large ≤ 10자, medium ≤ 18자, small ≤ 30자.
+   - 예: ref 의 huge 자막이 사용자 컷에서도 huge 여야 한다. large 면 large, medium 이면 medium (size 는 유지하되 글자수만 위 범위로).
    - **이 size_level 필드는 빈 값이나 누락 절대 금지. 모든 layer 가 4개 enum 중 하나로 반드시 지정한다.**
    - matched_ref_layers 가 비어있는 컷에서 새로 만들 때는 ref pattern 의 size_contrast 와 layer_count_typical
      을 보고 결정. uniform 이면 일관 medium, alternating/dramatic 이면 hook 은 huge/large, fact 는 medium. (size_ratio 도 그 size_level 에 맞춰 숫자로 채운다.)

@@ -62,6 +62,58 @@ const SHADOW_DEFAULT_BLUR_RATIO = 0.05;
 
 const LETTER_SPACING_EM: Record<string, number> = { tight: -0.02, normal: 0, wide: 0.06 };
 
+// enum(거친 단계) → 정밀 수치 폴백 매핑. LLM 이 정밀 number 필드(outline_ratio / letter_spacing_em /
+// font_width_ratio / font_weight)를 주면 그걸 '우선'하고, 없으면 아래 enum 값을 수치로 환산한다.
+const WEIGHT_HINT_MAP: Record<string, number> = { thin: 100, light: 300, regular: 400, medium: 500, bold: 700, black: 900 };
+const FONT_WIDTH_MAP: Record<string, number> = { condensed: 86, normal: 100, expanded: 115 };
+
+// ── 스타일 정밀 수치 resolve (정밀 number 우선, 없으면 enum 환산) ──
+// "유무/정도만" 나타내던 enum 들을 연속 수치로 받아 ASS 렌더에 직접 흘려보내기 위한 단일 창구.
+function resolveOutlineRatio(layer: CaptionLayer): number {
+  const r = Number(layer.outline_ratio);
+  if (Number.isFinite(r) && r >= 0) return clampNum(r, 0, 0.2);
+  return OUTLINE_RATIO[String(layer.outline_thickness || 'none').toLowerCase()] ?? 0;
+}
+function resolveLetterSpacingEm(layer: CaptionLayer): number {
+  const e = Number(layer.letter_spacing_em);
+  if (Number.isFinite(e)) return clampNum(e, -0.1, 0.4);
+  return LETTER_SPACING_EM[String(layer.letter_spacing || 'normal').toLowerCase()] ?? 0;
+}
+function resolveFontWidthScale(layer: CaptionLayer): number {
+  const w = Number(layer.font_width_ratio);
+  if (Number.isFinite(w) && w > 0) return clampNum(Math.round(w), 55, 150);
+  const fw = String(layer.font_width || '').toLowerCase();
+  const cat = String(layer.font_category || '').toLowerCase();
+  if (fw === 'condensed' || cat === 'condensed') return FONT_WIDTH_MAP.condensed;
+  if (fw === 'expanded') return FONT_WIDTH_MAP.expanded;
+  return 100;
+}
+function resolveFontWeight(layer: CaptionLayer): number {
+  const w = Number(layer.font_weight);
+  if (Number.isFinite(w) && w >= 100 && w <= 900) return Math.round(w);
+  const hint = WEIGHT_HINT_MAP[String(layer.font_weight_hint || '').toLowerCase()];
+  if (hint) return hint;
+  const emp = String(layer.emphasis || '').toLowerCase();
+  return emp === 'black' ? 900 : emp === 'bold' ? 700 : 400;
+}
+// 박스 padding(px) — blockH/blockW(prepareLayer)와 buildStyleLine 이 '동일한 값'을 쓰도록 단일화.
+// (이전엔 두 곳 공식이 달라 계산상 박스와 렌더 박스가 어긋났다.)
+function boxPaddingPx(layer: CaptionLayer, fontSize: number): number {
+  const raw = Number.isFinite(layer.background_padding) ? Number(layer.background_padding) : fontSize * 0.22;
+  return clampNum(Math.round(raw), 4, 60);
+}
+// 텍스트가 쓸 수 있는 가로 예산(px). 박스 자막은 좌우를 조금 더 쓰게 한다(박스 padding 은 blockW 에서 별도 가산).
+function widthBudgetFor(layer: CaptionLayer): number {
+  return layer.has_background_box ? (SCRIPT_W - H_MARGIN) : CAPTION_MAX_W; // 박스 1032 / 일반 984
+}
+// size 단계별 최대 줄 수 — 큰 hook 은 줄을 적게(임팩트 유지), 본문은 더 허용.
+function maxLinesFor(sizeLevel: string): number {
+  if (sizeLevel === 'huge') return 2;
+  if (sizeLevel === 'large') return 3;
+  if (sizeLevel === 'medium') return 3;
+  return 4; // small
+}
+
 // ============================================================
 // 타입 — Stage 1 caption planning 출력과 1:1 (SVG 버전과 동일).
 // ============================================================
@@ -85,7 +137,8 @@ export type CaptionLayer = {
   tone?: string;
 
   outline_color_hex?: string;
-  outline_thickness?: string;   // none | thin | medium | thick
+  outline_thickness?: string;   // none | thin | medium | thick (거친 단계 폴백)
+  outline_ratio?: number;       // 정밀 외곽선 두께 = 두께 ÷ 글자높이(fontSize). 있으면 enum 대신 이걸 우선.
 
   has_shadow?: boolean;
   shadow_color_hex?: string;
@@ -101,8 +154,10 @@ export type CaptionLayer = {
 
   // 글자 모양 재현 힌트 (optional) — 번들 폰트 매핑 정확도를 높이기 위함.
   font_family_hint?: string;     // 레퍼런스 폰트 이름 추정 (예: "Black Han Sans", "Pretendard"). 번들 family 와 매칭되면 우선.
-  font_width?: string;           // normal | condensed | expanded — 자폭 인상.
-  font_weight_hint?: string;     // thin | light | regular | medium | bold | black 등 굵기 인상.
+  font_width?: string;           // normal | condensed | expanded — 자폭 인상(거친 단계 폴백).
+  font_width_ratio?: number;     // 정밀 자폭 = \fscx %(100=기본, <100 압축, >100 확장). 있으면 enum 대신 우선.
+  font_weight_hint?: string;     // thin | light | regular | medium | bold | black 등 굵기 인상(거친 단계 폴백).
+  font_weight?: number;          // 정밀 굵기 100~900(OpenType wght). 있으면 hint/emphasis 대신 우선.
   font_style_notes?: string;     // 자유 서술 (예: "둥근 고딕, 약간 손글씨 느낌").
   gradient?: {
     type?: string;
@@ -114,7 +169,8 @@ export type CaptionLayer = {
   glow_color_hex?: string;
   glow_radius?: number;
 
-  letter_spacing?: string;       // tight | normal | wide
+  letter_spacing?: string;       // tight | normal | wide (거친 단계 폴백)
+  letter_spacing_em?: number;    // 정밀 자간 em(-0.05~0.15). 있으면 enum 대신 우선.
 
   entry_animation?: string;      // none | fade | pop | slide_in_top | slide_in_bottom | slide_in_left | slide_in_right
 };
@@ -292,6 +348,7 @@ export function preserveLayerDesign(raw: any): Partial<CaptionLayer> {
   if (outlineColor) out.outline_color_hex = outlineColor;
   const outlineThickness = str(raw.outline_thickness);
   if (outlineThickness) out.outline_thickness = outlineThickness.toLowerCase();
+  if (num(raw.outline_ratio) !== undefined) out.outline_ratio = Number(raw.outline_ratio);
 
   if (raw.has_shadow === true || raw.has_shadow === false) out.has_shadow = raw.has_shadow === true;
   const shadowColor = str(raw.shadow_color_hex);
@@ -317,6 +374,7 @@ export function preserveLayerDesign(raw: any): Partial<CaptionLayer> {
 
   const ls = str(raw.letter_spacing);
   if (ls) out.letter_spacing = ls.toLowerCase();
+  if (num(raw.letter_spacing_em) !== undefined) out.letter_spacing_em = Number(raw.letter_spacing_em);
   const ea = str(raw.entry_animation);
   if (ea) out.entry_animation = ea.toLowerCase();
 
@@ -325,8 +383,10 @@ export function preserveLayerDesign(raw: any): Partial<CaptionLayer> {
   if (ffh) out.font_family_hint = ffh;
   const fw = str(raw.font_width);
   if (fw) out.font_width = fw.toLowerCase();
+  if (num(raw.font_width_ratio) !== undefined) out.font_width_ratio = Number(raw.font_width_ratio);
   const fwh = str(raw.font_weight_hint);
   if (fwh) out.font_weight_hint = fwh.toLowerCase();
+  if (num(raw.font_weight) !== undefined) out.font_weight = Number(raw.font_weight);
   const fsn = str(raw.font_style_notes);
   if (fsn) out.font_style_notes = fsn;
 
@@ -393,6 +453,8 @@ export function sanitizeLayer(raw: any, global: GlobalCaptionStyle): CaptionLaye
     outline_thickness: String(
       raw.outline_thickness ?? (global.has_outline === false ? 'none' : (global.outline_thickness || 'medium')),
     ).toLowerCase(),
+    // 정밀 외곽선 두께(있으면 enum 대신 우선) — resolveOutlineRatio 가 clamp.
+    outline_ratio: Number.isFinite(raw.outline_ratio) ? Number(raw.outline_ratio) : undefined,
 
     has_shadow: raw.has_shadow === true || (raw.has_shadow === undefined && global.has_shadow === true),
     shadow_color_hex: normHex(raw.shadow_color_hex || '#000000'),
@@ -414,7 +476,9 @@ export function sanitizeLayer(raw: any, global: GlobalCaptionStyle): CaptionLaye
     // 글자 모양 힌트 — 폰트 선택에 활용 (있을 때만).
     font_family_hint: raw.font_family_hint ? String(raw.font_family_hint) : undefined,
     font_width: raw.font_width ? String(raw.font_width).toLowerCase() : undefined,
+    font_width_ratio: Number.isFinite(raw.font_width_ratio) ? Number(raw.font_width_ratio) : undefined,
     font_weight_hint: raw.font_weight_hint ? String(raw.font_weight_hint).toLowerCase() : undefined,
+    font_weight: Number.isFinite(raw.font_weight) ? Number(raw.font_weight) : undefined,
 
     gradient: normalizeGradient(raw.gradient),
 
@@ -423,6 +487,7 @@ export function sanitizeLayer(raw: any, global: GlobalCaptionStyle): CaptionLaye
     glow_radius: Number.isFinite(raw.glow_radius) ? Number(raw.glow_radius) : 8,
 
     letter_spacing: String(raw.letter_spacing || 'normal').toLowerCase(),
+    letter_spacing_em: Number.isFinite(raw.letter_spacing_em) ? Number(raw.letter_spacing_em) : undefined,
     entry_animation: String(raw.entry_animation || 'none').toLowerCase(),
   };
 
@@ -489,36 +554,48 @@ function prepareLayer(layer: CaptionLayer, global: GlobalCaptionStyle): Prepared
   const bucketLevel = (llmLevel in SIZE_PT) ? llmLevel : autoSizeLevel(truncated);
   const sizeLevel = precisePx !== undefined ? bucketForSizePx(precisePx) : bucketLevel;
   const requested = precisePx ?? (SIZE_PT[sizeLevel] ?? SIZE_PT.medium);
-  const fit = fitCaptionForFrame(truncated, requested, sizeLevel);
+  // fit 에 '폭 예산'(박스면 더 넓게)과 'size 단계별 줄 상한'을 넘겨 넘침 없는 캐스케이드를 돌린다.
+  const fit = fitCaptionForFrame(truncated, requested, sizeLevel, {
+    widthBudget: widthBudgetFor(layer),
+    maxLinesCap: maxLinesFor(sizeLevel),
+  });
 
+  // 굵기 — 정밀 font_weight(100~900) 우선. ASS Bold 는 on/off 뿐이라 600+ 면 Bold,
+  // 실제 굵기 차등은 weight 기반 폰트 선택(pickBundledFont)으로 반영한다.
+  const weight = resolveFontWeight(layer);
   const fontFamily = pickBundledFont({
     category: layer.font_category,
     personality: layer.font_personality,
     emphasis: layer.emphasis,
     familyHint: layer.font_family_hint,
     weightHint: layer.font_weight_hint,
+    weight,
   });
-  const bold = layer.emphasis === 'bold' || layer.emphasis === 'black';
+  const bold = weight >= 600;
   const italic = layer.italic === true;
-  const spacingPx = Math.round((LETTER_SPACING_EM[layer.letter_spacing || 'normal'] ?? 0) * fit.fontSize);
+  // 자간 — 정밀 letter_spacing_em(em) 우선, 없으면 tight/normal/wide 환산.
+  const spacingPx = Math.round(resolveLetterSpacingEm(layer) * fit.fontSize);
 
-  // condensed(좁은 자폭) — 번들에 진짜 condensed 한글 폰트가 없으므로 \fscx 가로압축으로 근사.
-  // (fit 이 이미 압축했으면 더 좁은 쪽 유지.)
-  const condensed = String(layer.font_width || '').toLowerCase() === 'condensed'
-    || String(layer.font_category || '').toLowerCase() === 'condensed';
-  const scaleX = condensed ? Math.min(fit.scaleX, 86) : fit.scaleX;
-
-  const lineHeight = Math.ceil(fit.fontSize * 1.32);
-  let blockH = lineHeight * fit.lines.length;
-  if (layer.has_background_box) {
-    // 박스 padding 도 fontSize 에 비례하게 (이전에는 고정 28px)
-    const padding = Math.max(8, Math.min(48, Math.round(fit.fontSize * (layer.background_padding ? 1 : 0.22))));
-    blockH += 2 * (layer.background_padding ?? padding);
+  // 자폭(\fscx) — 정밀 font_width_ratio 우선(없으면 condensed/expanded enum).
+  //  - 압축(<100): fit 압축과 더 좁은 쪽 채택. - 확장(>100): fit 가 폭부족으로 이미 압축했으면 포기,
+  //    여유 있으면 폭 예산 안에서만 확장(가로 넘침 방지).
+  const widthScale = resolveFontWidthScale(layer);
+  const widest = fit.lines.reduce((m, l) => Math.max(m, measureTextWidth(l, fit.fontSize)), 1);
+  let scaleX = fit.scaleX;
+  if (widthScale < 100) {
+    scaleX = Math.min(fit.scaleX, widthScale);
+  } else if (widthScale > 100 && fit.scaleX >= 100) {
+    const maxExpand = Math.floor((widthBudgetFor(layer) / widest) * 100);
+    scaleX = clampNum(Math.min(widthScale, Math.max(100, maxExpand)), 100, 150);
   }
 
-  // 블록 가로 폭 — 가로 좌표(horizontal_ratio) 배치 시 화면 밖으로 안 나가게 클램프하는 데 쓴다.
-  const widest = fit.lines.reduce((m, l) => Math.max(m, measureTextWidth(l, fit.fontSize)), 1);
-  const blockW = widest * (scaleX / 100);
+  // 박스 padding 은 단일 헬퍼로 통일(blockH/blockW/buildStyleLine 일치).
+  const boxPad = layer.has_background_box ? boxPaddingPx(layer, fit.fontSize) : 0;
+  const lineHeight = Math.ceil(fit.fontSize * 1.32);
+  const blockH = lineHeight * fit.lines.length + 2 * boxPad;
+
+  // 블록 가로 폭 — horizontal_ratio 배치/클램프용. 박스면 좌우 padding 포함해 실제 박스 폭으로 평가.
+  const blockW = widest * (scaleX / 100) + 2 * boxPad;
 
   return {
     layer,
@@ -767,11 +844,8 @@ function buildStyleLine(name: string, p: Prepared): string {
     borderStyle = 3;
     // 박스 배경색 + 투명도(background_alpha). alpha=0.5 면 반투명 박스, 1 이면 불투명.
     outlineColour = hexToAss(layer.background_color_hex || '#000000', layer.background_alpha);
-    // 박스 padding 도 fontSize 비례 (LLM 이 명시 안 하면 자동).
-    const pad = Number.isFinite(layer.background_padding)
-      ? Math.round(layer.background_padding as number)
-      : Math.round(p.fontSize * 0.22);
-    outline = clampNum(pad, 4, 60);
+    // 박스 padding — prepareLayer 의 blockH/blockW 와 동일한 헬퍼로 일치시킨다.
+    outline = boxPaddingPx(layer, p.fontSize);
   } else if (layer.has_glow) {
     borderStyle = 1;
     outlineColour = hexToAss(layer.glow_color_hex || layer.color_hex || '#FFFFFF');
@@ -780,9 +854,8 @@ function buildStyleLine(name: string, p: Prepared): string {
     outline = clampNum(Math.round(glow * 0.6), 3, 24);
   } else {
     borderStyle = 1;
-    // 외곽선 두께 = fontSize × 비율 (이전 px 고정 → 비례).
-    const ratio = OUTLINE_RATIO[String(layer.outline_thickness || 'none').toLowerCase()] ?? 0;
-    outline = Math.max(0, Math.round(p.fontSize * ratio));
+    // 외곽선 두께 = fontSize × 정밀 비율(outline_ratio 우선, 없으면 enum 환산).
+    outline = Math.max(0, Math.round(p.fontSize * resolveOutlineRatio(layer)));
   }
 
   if (layer.has_shadow) {
@@ -933,9 +1006,25 @@ function fadeMillis(anim: string, dur: number): number {
 function resolvePrimary(layer: CaptionLayer): string {
   const grad = layer.gradient;
   if (grad && grad.type === 'linear' && grad.stops && grad.stops.length >= 1) {
-    return grad.stops[0].color;
+    // ASS 는 글자 그라데이션 불가 → stops 평균색(대표색)으로 단색 degrade(첫 색만 쓰던 것 개선).
+    return averageHex(grad.stops.map(s => s.color)) || grad.stops[0].color;
   }
   return layer.color_hex || '#FFFFFF';
+}
+
+// 여러 hex 색의 평균(대표색). 그라데이션을 단색으로 degrade 할 때 사용.
+function averageHex(hexes: string[]): string | null {
+  const valid = hexes.map(normHex).filter(h => /^#[0-9A-F]{6}$/.test(h));
+  if (valid.length === 0) return null;
+  let r = 0, g = 0, b = 0;
+  for (const h of valid) {
+    r += parseInt(h.slice(1, 3), 16);
+    g += parseInt(h.slice(3, 5), 16);
+    b += parseInt(h.slice(5, 7), 16);
+  }
+  const n = valid.length;
+  const hx = (v: number) => Math.round(v / n).toString(16).padStart(2, '0');
+  return `#${hx(r)}${hx(g)}${hx(b)}`.toUpperCase();
 }
 
 // #RRGGBB → ASS &HAABBGGRR (BGR 순서). alpha(0~1, 1=불투명) 를 주면 AA 에 반영.
@@ -1095,38 +1184,28 @@ function fitCaptionForFrame(
   text: string,
   requestedSize: number,
   sizeLevel: string,
+  opts?: { widthBudget?: number; maxLinesCap?: number },
 ): { lines: string[]; fontSize: number; scaleX: number } {
   const minSize = MIN_SIZE_PT[sizeLevel] ?? 60;
+  // 폭 예산(박스면 더 넓게)과 size 단계별 줄 상한.
+  const budget = opts?.widthBudget && opts.widthBudget > 0 ? opts.widthBudget : CAPTION_MAX_W;
+  const lineCap = Math.max(2, opts?.maxLinesCap ?? 3);
 
-  // ─────────────────────────────────────────────────────
-  // 0) 명시적 줄바꿈(\n) 존중 — LLM/레퍼런스가 텍스트에 줄바꿈을 넣었으면 그게 "의도한 줄 구조".
-  //   너비 기준으로 다시 wrap 하면 의도와 다른 위치/줄수로 쪼개져 형태가 깨진다
-  //   (예: "노을 보며 마시는\n시원한 기린 생맥주" → 엉뚱하게 3줄). 그 줄 구조를 그대로 두고
-  //   폰트 축소 + \fscx 가로압축으로만 폭에 맞춘다(재wrap 없음).
-  //   한 줄에 \n 이 없으면(또는 1줄로 줄면) 아래 기존 로직으로 진행.
-  // ─────────────────────────────────────────────────────
+  // 0) 명시적 줄바꿈(\n) 존중 — LLM/레퍼런스가 넣은 줄 구조는 그대로 두고 폰트축소+압축으로만 맞춘다.
   if (/[\r\n]/.test(text)) {
     const explicit = text.split(/\r?\n/).map(s => s.replace(/\s+/g, ' ').trim()).filter(Boolean);
-    if (explicit.length >= 2) return fitFixedLines(explicit, requestedSize, minSize);
-    if (explicit.length === 1) text = explicit[0]; // 후행 개행 등 — 단일 줄로 정리 후 기존 로직
+    if (explicit.length >= 2) return fitFixedLines(explicit, requestedSize, minSize, budget);
+    if (explicit.length === 1) text = explicit[0];
   }
 
-  // ─────────────────────────────────────────────────────
-  // A0) 한 줄 유지 우선 (큰 hook 자막 한정: huge/large).
-  //   레퍼런스의 임팩트 자막은 보통 "한 줄"이다. 그런데 기존 로직은 1줄 레이아웃을 아예
-  //   시도하지 않고 곧장 2줄로 wrap 해서, "기린이찌방 한강점" 같은 한 덩어리가 2줄로
-  //   쪼개져 답답해 보였다. → 줄바꿈 전에, 요청 크기에서 폰트만 단계적으로 줄이며
-  //   \fscx 가로압축(하한 SINGLE_LINE_MIN_SCALEX)으로 한 줄에 맞춰본다. 맞으면 가장 큰
-  //   크기를 채택하고 한 줄을 유지. 끝내 한 줄로 못 담으면 아래 다줄 로직으로 폴백.
-  //   (medium/small 본문 자막은 2줄이 자연스러우므로 이 단계 제외 — 과도한 폰트 축소 방지.)
-  // ─────────────────────────────────────────────────────
+  // A0) huge/large 한 줄 유지 우선 — 임팩트 hook 은 한 줄이 자연스럽다.
   if (sizeLevel === 'huge' || sizeLevel === 'large') {
     const oneLine = text.replace(/\s+/g, ' ').trim();
     if (oneLine) {
       for (let size = requestedSize; size >= minSize; size -= 6) {
         const w = measureTextWidth(oneLine, size);
-        if (w <= CAPTION_MAX_W) return { lines: [oneLine], fontSize: size, scaleX: 100 };
-        const scaleX = Math.floor((CAPTION_MAX_W / w) * 100);
+        if (w <= budget) return { lines: [oneLine], fontSize: size, scaleX: 100 };
+        const scaleX = Math.floor((budget / w) * 100);
         if (scaleX >= SINGLE_LINE_MIN_SCALEX) {
           return { lines: [oneLine], fontSize: size, scaleX: clampNum(scaleX, SINGLE_LINE_MIN_SCALEX, 100) };
         }
@@ -1134,36 +1213,42 @@ function fitCaptionForFrame(
     }
   }
 
-  // 긴 한글 캡션은 2줄로 안 떨어져 폰트가 깎이던 주범 → 길면 3줄까지 허용(줄바꿈만, 형태 불변).
-  const nonSpaceLen = graphemes(text).filter(g => !/\s/.test(g)).length;
-  const lineOptions = nonSpaceLen > 12 ? [2, 3] : [2];
+  // 줄수 옵션: 2부터 size 단계 상한까지 점증.
+  const lineOptions: number[] = [];
+  for (let n = 2; n <= lineCap; n++) lineOptions.push(n);
+  if (lineOptions.length === 0) lineOptions.push(2);
 
   const tryFit = (size: number, maxLines: number): { lines: string[]; fontSize: number; scaleX: number } | null => {
-    const lines = wrapLinesNoTrunc(text, size, maxLines);
+    const lines = wrapLinesNoTrunc(text, size, maxLines, budget);
     const widest = maxLineWidth(lines, size);
-    if (widest <= CAPTION_MAX_W) return { lines, fontSize: size, scaleX: 100 };
-    const scaleX = Math.floor((CAPTION_MAX_W / widest) * 100);
+    if (widest <= budget) return { lines, fontSize: size, scaleX: 100 };
+    const scaleX = Math.floor((budget / widest) * 100);
     if (scaleX >= MIN_SCALEX) return { lines, fontSize: size, scaleX: clampNum(scaleX, MIN_SCALEX, 100) };
     return null;
   };
 
-  // A) 요청 크기 유지: 2줄 → (긴 텍스트면) 3줄, 각 단계에서 가로압축까지 시도.
+  // 사이즈 맞춤 캐스케이드 (요청하신 우선순위):
+  // (1) 요청 크기 유지 + 줄수 점증(=박스/폭예산 안에서 최대한 크게)
   for (const maxLines of lineOptions) {
     const hit = tryFit(requestedSize, maxLines);
     if (hit) return hit;
   }
-
-  // B) 요청 크기로 안 되면 폰트를 줄이며(최대 줄수 사용) 가로압축 병행.
+  // (2) 텍스트 크기 축소(최대 줄수 사용) + 가로압축
   const maxLines = lineOptions[lineOptions.length - 1];
   for (let size = requestedSize - 6; size >= minSize; size -= 6) {
     const hit = tryFit(size, maxLines);
     if (hit) return hit;
   }
-
-  // C) 최후 — minSize + 가능한 최대 압축.
-  const lines = wrapLinesNoTrunc(text, minSize, maxLines);
+  // (3) 줄 추가 escalation — minSize 에서 줄 수를 절대 상한까지 늘려 넘침 없이 담아본다.
+  const HARD_MAX_LINES = Math.max(maxLines, 6);
+  for (let extra = maxLines + 1; extra <= HARD_MAX_LINES; extra++) {
+    const hit = tryFit(minSize, extra);
+    if (hit) return hit;
+  }
+  // (4) 최종 보장 — minSize + 최대 줄수 + 절대 압축으로 '가로 넘침 0' 보장(최후엔 45%까지 눌러서라도).
+  const lines = wrapLinesNoTrunc(text, minSize, HARD_MAX_LINES, budget);
   const widest = maxLineWidth(lines, minSize);
-  const scaleX = clampNum(Math.floor((CAPTION_MAX_W / widest) * 100), FLOOR_SCALEX, 100);
+  const scaleX = clampNum(Math.floor((budget / widest) * 100), 45, 100);
   return { lines, fontSize: minSize, scaleX };
 }
 
@@ -1174,33 +1259,34 @@ function fitFixedLines(
   lines: string[],
   requestedSize: number,
   minSize: number,
+  budget: number = CAPTION_MAX_W,
 ): { lines: string[]; fontSize: number; scaleX: number } {
   for (let size = requestedSize; size >= minSize; size -= 6) {
     const widest = maxLineWidth(lines, size);
-    if (widest <= CAPTION_MAX_W) return { lines, fontSize: size, scaleX: 100 };
-    const scaleX = Math.floor((CAPTION_MAX_W / widest) * 100);
+    if (widest <= budget) return { lines, fontSize: size, scaleX: 100 };
+    const scaleX = Math.floor((budget / widest) * 100);
     if (scaleX >= MIN_SCALEX) return { lines, fontSize: size, scaleX: clampNum(scaleX, MIN_SCALEX, 100) };
   }
   const widest = maxLineWidth(lines, minSize);
-  const scaleX = clampNum(Math.floor((CAPTION_MAX_W / widest) * 100), FLOOR_SCALEX, 100);
+  const scaleX = clampNum(Math.floor((budget / widest) * 100), FLOOR_SCALEX, 100);
   return { lines, fontSize: minSize, scaleX };
 }
 
 // 줄바꿈만 수행(truncate 없음). maxLines 를 넘기면 나머지는 마지막 줄에 몰아 담고,
 // 폭 초과분은 호출부가 \fscx 로 흡수한다. (MAX_CAPTION_CHARS 로 길이는 이미 상한돼 있음.)
-function wrapLinesNoTrunc(text: string, fontSize: number, maxLines: number): string[] {
+function wrapLinesNoTrunc(text: string, fontSize: number, maxLines: number, budget: number = CAPTION_MAX_W): string[] {
   const normalized = text.replace(/\s+/g, ' ').trim();
   if (!normalized) return [''];
   const tokens = normalized.split(' ');
   const lines: string[] = [];
   let current = '';
   for (const token of tokens) {
-    const pieces = splitLongToken(token, fontSize);
+    const pieces = splitLongToken(token, fontSize, budget);
     for (const piece of pieces) {
       const candidate = current ? `${current} ${piece}` : piece;
       if (!current) {
         current = candidate;
-      } else if (lines.length < maxLines - 1 && measureTextWidth(candidate, fontSize) > CAPTION_MAX_W) {
+      } else if (lines.length < maxLines - 1 && measureTextWidth(candidate, fontSize) > budget) {
         lines.push(current);
         current = piece;
       } else {
@@ -1216,13 +1302,13 @@ function maxLineWidth(lines: string[], fontSize: number): number {
   return Math.max(1, ...lines.map(l => measureTextWidth(l, fontSize)));
 }
 
-function splitLongToken(token: string, fontSize: number): string[] {
-  if (measureTextWidth(token, fontSize) <= CAPTION_MAX_W) return [token];
+function splitLongToken(token: string, fontSize: number, budget: number = CAPTION_MAX_W): string[] {
+  if (measureTextWidth(token, fontSize) <= budget) return [token];
   const pieces: string[] = [];
   let current = '';
   for (const ch of graphemes(token)) {
     const candidate = current + ch;
-    if (current && measureTextWidth(candidate, fontSize) > CAPTION_MAX_W) {
+    if (current && measureTextWidth(candidate, fontSize) > budget) {
       pieces.push(current);
       current = ch;
     } else {
