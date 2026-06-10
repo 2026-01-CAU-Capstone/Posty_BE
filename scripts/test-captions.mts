@@ -178,9 +178,11 @@ const overlap = (a: { top: number; bottom: number }, b: { top: number; bottom: n
   ok('(f) 소프트 그림자 \\blur 적용(shadow_blur 렌더)', dlgs.length === 2 && dlgs.every(d => /\\blur\d/.test(d)), dlgs[0].match(/\\blur\d+/)?.[0] || 'none');
 }
 
-// ── (g) reinjectRefStyle 이 ref 의 그림자/글로우 기하 + 폰트 힌트를 재주입 ──
+// ── (g) reinjectRefStyle: 색 일치 시 글로우/그림자흐림까지 재주입, 불일치 시 글자 본체를
+//        흐리는 효과(glow/blur)는 재주입 안 함(가독성 보호). 오프셋·폰트힌트는 색 무관 항상. ──
 {
-  const planned: CaptionLayer[] = [{ text: '플랜 카피', color_hex: '#FFFFFF' }];
+  // (g-1) 색 일치 → glow/blur/offset/폰트 전부 재주입.
+  const planned: CaptionLayer[] = [{ text: '플랜 카피', color_hex: '#FDE200' }];
   const ref: CaptionLayer[] = [{
     text: '레프', color_hex: '#FDE200',
     has_shadow: true, shadow_blur: 16, shadow_offset_x: 3, shadow_offset_y: 7,
@@ -188,10 +190,22 @@ const overlap = (a: { top: number; bottom: number }, b: { top: number; bottom: n
     font_family_hint: 'Black Han Sans', font_weight_hint: 'black', font_width: 'normal',
   }];
   const o = reinjectRefStyle(planned, ref)[0];
-  ok('(g) shadow_blur 재주입', o.shadow_blur === 16, String(o.shadow_blur));
-  ok('(g) shadow_offset 재주입', o.shadow_offset_x === 3 && o.shadow_offset_y === 7);
-  ok('(g) glow_radius 재주입', o.glow_radius === 20, String(o.glow_radius));
+  ok('(g) 색일치 — shadow_blur 재주입', o.shadow_blur === 16, String(o.shadow_blur));
+  ok('(g) 색일치 — shadow_offset 재주입', o.shadow_offset_x === 3 && o.shadow_offset_y === 7);
+  ok('(g) 색일치 — glow_radius 재주입', o.glow_radius === 20, String(o.glow_radius));
   ok('(g) 폰트 힌트 재주입', o.font_family_hint === 'Black Han Sans' && o.font_weight_hint === 'black');
+
+  // (g-2) 색 불일치(흰 자막 ↔ 노란 ref) → glow/blur 는 미재주입(글자 안 흐림), offset·폰트는 재주입.
+  const plannedM: CaptionLayer[] = [{ text: '흰 자막', color_hex: '#FFFFFF' }];
+  const refY: CaptionLayer[] = [{
+    text: '노란 ref', color_hex: '#FDE200',
+    has_shadow: true, shadow_blur: 16, shadow_offset_x: 3, shadow_offset_y: 7,
+    has_glow: true, glow_radius: 20,
+    font_family_hint: 'Black Han Sans', font_weight_hint: 'black',
+  }];
+  const m = reinjectRefStyle(plannedM, refY)[0];
+  ok('(g) 색불일치 — glow/blur 미재주입(글자 안 흐림)', m.has_glow !== true && m.glow_radius === undefined && m.shadow_blur === undefined);
+  ok('(g) 색불일치 — offset·폰트힌트는 재주입', m.shadow_offset_x === 3 && m.shadow_offset_y === 7 && m.font_family_hint === 'Black Han Sans');
 
   // 색 기반 매칭: ref 레이어 순서가 뒤집혀도(노랑이 먼저) 색으로 맞춰 vr 이 안 뒤바뀐다.
   const planned2: CaptionLayer[] = [

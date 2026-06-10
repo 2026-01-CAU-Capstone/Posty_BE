@@ -926,15 +926,16 @@ function buildDialogueLine(styleName: string, p: Prepared, start: number, end: n
     //  파싱·보존만 되고 렌더에서 완전히 무시됐다.) 박스가 있으면 무의미, 글로우가 이미 \blur 를
     //  넣는 경우는 중복을 피한다.
     if (!layer.has_background_box && !layer.has_glow) {
+      // \blur 는 글자 '본체'까지 흐린다 → 상한을 낮게(가독성 가드). 큰 값이 와도 글자가 안 뭉개지게.
       const sb = Number(layer.shadow_blur);
-      if (Number.isFinite(sb) && sb > 0) tags.push(`\\blur${clampNum(Math.round(sb), 1, 24)}`);
+      if (Number.isFinite(sb) && sb > 0) tags.push(`\\blur${clampNum(Math.round(sb), 1, 6)}`);
     }
   }
 
-  // 글로우 근사 — 외곽선을 부드럽게 blur (fontSize 비례)
+  // 글로우 근사 — 외곽선을 부드럽게 blur (fontSize 비례). 글자 본체도 흐려지므로 상한을 낮게 둔다.
   if (layer.has_glow && !layer.has_background_box) {
     const fallback = Math.round(p.fontSize * 0.08);
-    const blur = clampNum(Math.round(layer.glow_radius ?? fallback), 2, 28);
+    const blur = clampNum(Math.round(layer.glow_radius ?? fallback), 2, 10);
     tags.push(`\\blur${blur}`);
   }
 
