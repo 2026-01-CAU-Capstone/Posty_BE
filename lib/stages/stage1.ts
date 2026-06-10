@@ -914,6 +914,12 @@ export function reinjectRefStyle(planned: CaptionLayer[], ref?: CaptionLayer[]):
       if (shadowColor) out.shadow_color_hex = shadowColor;
       const glowColor = str(r.glow_color_hex);
       if (glowColor) out.glow_color_hex = glowColor;
+      // 글자 '본체'를 흐리는 효과(글로우/그림자 흐림)는 색이 맞을 때만 재주입한다.
+      // 색이 다른 자막에까지 전파하면 ASS \blur 가 글자를 통째로 흐려 가독성이 깨진다
+      // (자막이 통째로 blur·반투명해지던 회귀의 원인). 그림자 '오프셋'(흐림 아님)은 아래에서 항상 적용.
+      if (typeof r.has_glow === 'boolean') out.has_glow = r.has_glow;
+      if (num(r.glow_radius) !== undefined) out.glow_radius = r.glow_radius;
+      if (num(r.shadow_blur) !== undefined) out.shadow_blur = r.shadow_blur;
       if (r.gradient && typeof r.gradient === 'object') out.gradient = r.gradient;
       // color_runs(글자 중간 색변경)는 ref 에 있고 LLM 이 자체 runs 를 만들지 않았을 때만
       // ref 색 시퀀스를 빌려온다 (렌더러가 grapheme 순서로 매핑하므로 텍스트가 달라도 색만 따라감).
@@ -923,18 +929,15 @@ export function reinjectRefStyle(planned: CaptionLayer[], ref?: CaptionLayer[]):
       }
     }
     // ── 글자 모양 힌트 + 형태/기하 — 색과 무관하므로 색 매칭과 별개로 '항상' 재주입. ──
-    // 그림자/글로우/외곽선의 '기하'(흐림/오프셋/반경/두께)와 폰트 굵기·자폭·자간 정밀 수치는
-    // ref 그대로 살려야 plan 후 sanitize 기본값(blur 무시 / offset y=4 / 두께 medium 등)으로
-    // 뭉개지지 않고 렌더까지 반영된다. (색 계열만 colorOk 게이트로 보호.)
+    // 폰트 굵기·자폭·자간·외곽선 두께, 그림자 '오프셋'(방향/거리) 등 글자를 흐리지 않는 정밀 수치만
+    // 항상 살린다. (글자 본체를 흐리는 has_glow/glow_radius/shadow_blur 는 위 colorOk 블록으로 이동 —
+    //  색이 다른 자막까지 \blur 가 전파돼 통째로 흐려지던 회귀 방지.)
     const ffh = str(r.font_family_hint); if (ffh) out.font_family_hint = ffh;
     const fw = str(r.font_width); if (fw) out.font_width = fw;
     const fwh = str(r.font_weight_hint); if (fwh) out.font_weight_hint = fwh;
     if (typeof r.has_shadow === 'boolean') out.has_shadow = r.has_shadow;
-    if (num(r.shadow_blur) !== undefined) out.shadow_blur = r.shadow_blur;
     if (num(r.shadow_offset_x) !== undefined) out.shadow_offset_x = r.shadow_offset_x;
     if (num(r.shadow_offset_y) !== undefined) out.shadow_offset_y = r.shadow_offset_y;
-    if (typeof r.has_glow === 'boolean') out.has_glow = r.has_glow;
-    if (num(r.glow_radius) !== undefined) out.glow_radius = r.glow_radius;
     const ot = str(r.outline_thickness); if (ot) out.outline_thickness = ot;
     if (num(r.outline_ratio) !== undefined) out.outline_ratio = r.outline_ratio;
     if (num(r.font_weight) !== undefined) out.font_weight = r.font_weight;
