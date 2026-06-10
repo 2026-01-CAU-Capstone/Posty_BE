@@ -627,6 +627,15 @@ export function mergeCropStyleIntoLayer(layer: any, crop: any): void {
   if (str(crop.font_family_hint)) layer.font_family_hint = crop.font_family_hint;
   if (str(crop.font_width)) layer.font_width = String(crop.font_width).toLowerCase();
   if (str(crop.letter_spacing)) layer.letter_spacing = String(crop.letter_spacing).toLowerCase();
+
+  // 정밀 수치 필드(크롭 확대분석이 더 정확하므로 number 우선 덮어쓰기). enum 과 공존 가능 — 렌더의
+  // resolve* 헬퍼가 number 를 우선한다.
+  if (num(crop.outline_ratio) !== undefined) layer.outline_ratio = Number(crop.outline_ratio);
+  if (num(crop.font_weight) !== undefined) layer.font_weight = Number(crop.font_weight);
+  if (num(crop.font_width_ratio) !== undefined) layer.font_width_ratio = Number(crop.font_width_ratio);
+  if (num(crop.letter_spacing_em) !== undefined) layer.letter_spacing_em = Number(crop.letter_spacing_em);
+  if (num(crop.shadow_offset_x) !== undefined) layer.shadow_offset_x = Number(crop.shadow_offset_x);
+  if (num(crop.shadow_offset_y) !== undefined) layer.shadow_offset_y = Number(crop.shadow_offset_y);
 }
 
 // Stage 0 에서 분리한 자막 스타일 정밀화 — 컷편집(Stage 1)과 병렬로 실행하기 위한 진입점.
