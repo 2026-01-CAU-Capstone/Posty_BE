@@ -471,7 +471,10 @@ app.post('/api/bgm-pick', async (c) => {
   const identifier = String(body.identifier || '').trim();
   if (!sourceUrl) return c.json({ error: 'source_url 누락' }, 400);
 
-  const safeName = `archive_${identifier.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40)}.mp3`;
+  // ⚠ 접두사는 'picked_' 여야 한다. stage4 는 'archive_' 접두사 파일을 '자동검색 잔재(oldArchive)'로
+  // 보고 삭제 후 AudD+Archive 로 다른 곡을 재검색한다. 사용자가 고른 트랙은 'uploaded'(최우선)로
+  // 인식되도록 'archive_' 가 아닌 접두사를 써서, 고른 곡 그대로 입히고 재검색을 건너뛴다(빠름).
+  const safeName = `picked_${identifier.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40)}.mp3`;
   const destPath = path.join(dir, safeName);
   try {
     await downloadBgmTrack(sourceUrl, destPath);
