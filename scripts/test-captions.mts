@@ -175,7 +175,7 @@ const overlap = (a: { top: number; bottom: number }, b: { top: number; bottom: n
   const bb = placed.map(layerBBox).sort((a, b) => a.top - b.top);
   ok('(f) captions.ass 두 Dialogue 겹침 없음', bb.length === 2 && overlap(bb[0], bb[1]) <= 0, `bbox=${bb.map(b => `[${b.top}~${b.bottom}]`).join(' ')}`);
   const dlgs = ass.split('\n').filter(l => l.startsWith('Dialogue:'));
-  ok('(f) 소프트 그림자 \\blur 적용(shadow_blur 렌더)', dlgs.length === 2 && dlgs.every(d => /\\blur\d/.test(d)), dlgs[0].match(/\\blur\d+/)?.[0] || 'none');
+  ok('(f) 또렷한 드롭섀도(\\yshad) + \\blur 전면 제거', dlgs.length === 2 && dlgs.every(d => /\\yshad\d/.test(d) && !/\\blur/.test(d)), dlgs[0].match(/\{[^}]*\}/)?.[0] || 'none');
 }
 
 // ── (g) reinjectRefStyle: 색 일치 시 글로우/그림자흐림까지 재주입, 불일치 시 글자 본체를
