@@ -1,0 +1,180 @@
+// ============================================================
+// 경량 in-process 작업 큐.
+// - 무거운 파이프라인을 HTTP 요청 경로 밖(비동기)에서 실행 → 30분 타임아웃/요청 블로킹 회피.
+// - 동시성 제한(WORKER_CONCURRENCY, 기본 1)으로 ffmpeg CPU 폭주 방지.
+// - 작업 상태/진행상황을 메모리에 보관, 프런트가 jobId 로 polling.
+//   (프로세스 재시작 시 휘발 — MVP. 필요 시 디스크/Postgres 로 승격.)
+// ============================================================
+
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+
+export type JobType = 'run_all' | 'stage';
+export type JobStatus = 'pending' | 'running' | 'done' | 'error';
+
+export type ProgressEntry = { step: string; msg: string; at: string; extra?: any };
+
+export type Job = {
+  id: string;
+  type: JobType;
+  projectId: string;
+  params: any;
+  status: JobStatus;
+  progress: ProgressEntry[];
+  result?: any;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+};
+
+export type ProgressFn = (step: string, msg: string, extra?: any) => void;
+export type Runner = (job: Job, progress: ProgressFn) => Promise<any>;
+
+const jobs = new Map<string, Job>();
+const pendingQueue: string[] = [];
+let running = 0;
+const CONCURRENCY = Math.max(1, Number(process.env.WORKER_CONCURRENCY || 1));
+
+let runner: Runner | null = null;
+export function setRunner(r: Runner): void {
+  runner = r;
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+// ── 디스크 영속화 ────────────────────────────────────────────
+// 프로세스 재시작(tsx watch 리로드 등)에도 job 상태가 유지되도록 data/jobs.json 에 저장.
+// (이전엔 in-memory 휘발 → 재시작하면 프런트가 getJob 404 를 무한 폴링하며 진행이 멈췄음)
+const JOBS_FILE = path.join(process.cwd(), 'data', 'jobs.json');
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+function persistNow(): void {
+  if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+  try {
+    fs.mkdirSync(path.dirname(JOBS_FILE), { recursive: true });
+    const tmp = JOBS_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(Array.from(jobs.values())), 'utf8');
+    fs.renameSync(tmp, JOBS_FILE); // 원자적 교체 — 쓰는 도중 손상 방지
+  } catch { /* 영속화 실패는 비치명적 */ }
+}
+function persistSoon(): void {
+  if (persistTimer) return;
+  persistTimer = setTimeout(persistNow, 400);
+}
+// 시작 시 로드 — 중단된(running/pending) job 은 'error' 로 표시해
+// 프런트의 자동 재시도(마지막 완료 stage 다음부터 재실행)가 이어받게 한다.
+(function loadPersistedJobs(): void {
+  try {
+    if (!fs.existsSync(JOBS_FILE)) return;
+    const arr = JSON.parse(fs.readFileSync(JOBS_FILE, 'utf8'));
+    if (!Array.isArray(arr)) return;
+    for (const j of arr) {
+      if (!j || typeof j.id !== 'string') continue;
+      if (j.status === 'running' || j.status === 'pending') {
+        j.status = 'error';
+        j.error = '백엔드 재시작으로 작업이 중단됐어요. 자동으로 이어서 다시 시도합니다.';
+        j.finishedAt = j.finishedAt || nowIso();
+        j.updatedAt = nowIso();
+      }
+      jobs.set(j.id, j as Job);
+    }
+  } catch { /* 손상된 파일은 무시하고 새로 시작 */ }
+})();
+
+export function createJob(type: JobType, projectId: string, params: any): Job {
+  const id = 'job_' + crypto.randomBytes(6).toString('hex');
+  const job: Job = {
+    id, type, projectId, params,
+    status: 'pending', progress: [],
+    createdAt: nowIso(), updatedAt: nowIso(),
+  };
+  jobs.set(id, job);
+  pendingQueue.push(id);
+  persistSoon();
+  pump();
+  return job;
+}
+
+export function getJob(id: string): Job | undefined {
+  return jobs.get(id);
+}
+
+// 같은 프로젝트의 "활성(pending/running)" 동일 stage 잡을 찾는다.
+// 프런트의 hang/error 자동 재시도가 이미 돌고 있는 Stage 0 위에 중복 잡을 쌓으면
+// (동시성 1) 같은 분석을 두세 번 반복하고 startedAt 리셋으로 진행률이 99%→2% 로
+// 떨어진다. 중복 요청은 새 잡을 만들지 않고 기존 활성 잡으로 합친다.
+export function findActiveStageJob(projectId: string, stage: number): Job | undefined {
+  for (const j of jobs.values()) {
+    if (j.type !== 'stage') continue;
+    if (j.projectId !== projectId) continue;
+    if (Number(j.params?.stage) !== stage) continue;
+    if (j.status === 'pending' || j.status === 'running') return j;
+  }
+  return undefined;
+}
+
+// 공개용 직렬화 (내부 필드 그대로지만 안전하게 복사)
+export function publicJob(job: Job) {
+  return {
+    id: job.id,
+    type: job.type,
+    projectId: job.projectId,
+    status: job.status,
+    progress: job.progress,
+    result: job.result ?? null,
+    error: job.error ?? null,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    startedAt: job.startedAt ?? null,
+    finishedAt: job.finishedAt ?? null,
+  };
+}
+
+function pump(): void {
+  while (running < CONCURRENCY && pendingQueue.length > 0) {
+    const id = pendingQueue.shift()!;
+    const job = jobs.get(id);
+    if (!job) continue;
+    running++;
+    runOne(job).finally(() => {
+      running--;
+      pump();
+    });
+  }
+}
+
+async function runOne(job: Job): Promise<void> {
+  if (!runner) {
+    job.status = 'error';
+    job.error = 'job runner 가 설정되지 않았습니다';
+    job.finishedAt = nowIso();
+    return;
+  }
+  job.status = 'running';
+  job.startedAt = nowIso();
+  job.updatedAt = nowIso();
+  persistSoon();
+
+  const progress: ProgressFn = (step, msg, extra) => {
+    job.progress.push({ step, msg, at: nowIso(), extra });
+    job.updatedAt = nowIso();
+    persistSoon();
+  };
+
+  try {
+    job.result = await runner(job, progress);
+    job.status = 'done';
+  } catch (e: any) {
+    job.status = 'error';
+    job.error = e?.message || String(e);
+    progress('error', job.error);
+  } finally {
+    job.finishedAt = nowIso();
+    job.updatedAt = nowIso();
+    persistNow(); // 완료/에러는 즉시 디스크 반영
+  }
+}
