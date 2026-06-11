@@ -1,0 +1,77 @@
+# ============================================================
+# Posty 백엔드 풀 스택 (backend + ig-fetch + postgres).
+# 프런트엔드(Posty_FE)는 별도 정적 배포 — 이 compose 에 포함되지 않음.
+#
+# 사용:
+#   1) repo 루트에 .env 작성 (GEMINI_API_KEY, OPENAI_API_KEY 등 — DEPLOY.md 참고)
+#   2) docker compose up -d --build
+#   3) 프런트(VITE_API_BASE)를 이 백엔드 주소(기본 :8787)로 지정
+#
+# 외부로 노출되는 건 backend(:8787) 뿐. ig-fetch/postgres 는 내부 네트워크 전용.
+# ============================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: posty
+      POSTGRES_PASSWORD: posty
+      POSTGRES_DB: posty
+    volumes:
+      - posty_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U posty -d posty"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ig-fetch:
+    build:
+      context: ./ig-fetch
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://posty:posty@postgres:5432/posty
+      STORAGE_BACKEND: local
+      LOCAL_STORAGE_DIR: /app/storage
+      # backend 컨테이너가 받아갈 수 있도록 'localhost' 가 아닌 서비스명으로.
+      LOCAL_STORAGE_PUBLIC_URL: http://ig-fetch:8000/static
+      # (선택) 사진 Post fetch 에 필요한 IG 쿠키 — 없으면 릴스(yt-dlp)만 동작.
+      IG_SESSIONID: ${IG_SESSIONID:-}
+      IG_DS_USER_ID: ${IG_DS_USER_ID:-}
+    volumes:
+      - posty_igstorage:/app/storage
+    # 내부 전용 (host 로 노출 안 함). 디버깅하려면 아래 주석 해제.
+    # ports:
+    #   - "8000:8000"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - ig-fetch
+    environment:
+      BACKEND_PORT: "8787"
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?GEMINI_API_KEY 가 .env 에 필요합니다}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY 가 .env 에 필요합니다}
+      GEMINI_PRO_MODEL: ${GEMINI_PRO_MODEL:-gemini-2.5-pro}
+      GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-3.5-flash}
+      GEMINI_TTS_MODEL: ${GEMINI_TTS_MODEL:-gemini-2.5-flash-preview-tts}
+      OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-gpt-4o-mini}
+      AUDD_API_TOKEN: ${AUDD_API_TOKEN:-}
+      # 같은 compose 네트워크의 ig-fetch 서비스
+      IG_FETCH_BASE: http://ig-fetch:8000
+    volumes:
+      - posty_data:/app/data
+    ports:
+      - "8787:8787"
+
+volumes:
+  posty_pgdata:
+  posty_igstorage:
+  posty_data:

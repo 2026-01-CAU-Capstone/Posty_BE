@@ -1,0 +1,6 @@
+# 배포 관련 스크립트/설정은 OS 무관하게 LF 강제.
+# (CRLF 면 리눅스 컨테이너에서 `bash: \r: command not found` 등으로 빌드/실행이 깨진다)
+*.sh               text eol=lf
+Dockerfile         text eol=lf
+.dockerignore      text eol=lf
+docker-compose.yml text eol=lf
