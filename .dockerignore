@@ -1,0 +1,22 @@
+# build context 최소화 — 큰/불필요/비밀 파일 제외
+.git
+**/node_modules
+data
+assets/fonts/*.ttf
+assets/fonts/*.otf
+.env
+.env.local
+**/.env.local
+*.log
+dist
+**/dist
+.claude
+tsconfig.tsbuildinfo
+
+# ig-fetch 는 별도 이미지(./ig-fetch context)로 빌드 → backend 이미지엔 불필요
+ig-fetch
+
+# 프런트(별도 repo/이미지)
+frontend
+_fe_push
+_tmp_extract
