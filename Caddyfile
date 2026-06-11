@@ -1,0 +1,8 @@
+# Posty 백엔드 리버스 프록시 — 자동 HTTPS (Let's Encrypt).
+# DOMAIN 환경변수에 도메인(예: api.posty.example.com)을 넣으면 Caddy 가
+# 인증서를 자동 발급/갱신하고 :443 으로 backend(:8787)에 프록시한다.
+# (DOMAIN=localhost 로 두면 로컬 테스트용 self-signed(internal) 인증서를 쓴다.)
+{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy backend:8787
+}

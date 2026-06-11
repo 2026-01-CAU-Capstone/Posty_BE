@@ -1,0 +1,32 @@
+# ============================================================
+# 클라우드 VM 프로덕션 오버레이 — Caddy 리버스 프록시로 자동 HTTPS.
+#
+# 사용:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# 전제: .env 에 DOMAIN=<도메인> 추가 + 그 도메인의 A레코드가 이 VM 공인 IP 를 가리킴.
+# 효과: 외부엔 Caddy(:80/:443)만 공개되고 backend 직접 포트(:8787)는 닫힌다.
+# ============================================================
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: "${DOMAIN:?DOMAIN 을 .env 에 설정하세요 - 예 api.example.com 또는 테스트시 localhost}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  backend:
+    # 프로덕션에선 backend 를 호스트에 직접 노출하지 않는다 (Caddy 만 공개).
+    ports: !reset []
+
+volumes:
+  caddy_data:
+  caddy_config:
