@@ -57,7 +57,8 @@ npm install
 VITE_API_BASE=https://<백엔드-공개주소> npm run build   # dist/ 생성
 ```
 
-- 빌드 시 `VITE_API_BASE` 를 **위에서 띄운 백엔드 주소**로 지정 (예: `http://1.2.3.4:8787` 또는 도메인).
+- 빌드 시 `VITE_API_BASE` 를 **위에서 띄운 백엔드 주소**로 지정.
+- ⚠️ **Vercel/Netlify(HTTPS)에 올리면 백엔드도 HTTPS 여야 합니다** — HTTPS 페이지가 `http://...:8787` 을 호출하면 브라우저가 mixed-content 로 차단합니다. 백엔드 HTTPS 는 아래 **§5(Caddy 자동 HTTPS)** 참고.
 - Vercel/Netlify 라면 프로젝트 환경변수에 `VITE_API_BASE` 를 넣고 `dist/` 를 배포 대상으로.
 - 백엔드는 CORS `*` 허용이라 별도 설정 불필요.
 
@@ -70,3 +71,37 @@ VITE_API_BASE=https://<백엔드-공개주소> npm run build   # dist/ 생성
 - **로그**: `docker compose logs -f backend` / `... ig-fetch`. 파이프라인 상세 디버그는 backend 환경변수 `FFMPEG_VERBOSE=1`.
 - **HTTPS/도메인**: 공개 서비스라면 backend 앞에 리버스 프록시(Nginx/Caddy)로 TLS 종료 권장.
 - **단일 컨테이너 PaaS(Render/Railway/Fly) 로 가려면**: 서비스를 backend / ig-fetch 둘로 나눠 각각 이 Dockerfile 로 배포하고, Postgres 는 매니지드 DB 를 붙인 뒤 위 환경변수(`DATABASE_URL`, `IG_FETCH_BASE`, `LOCAL_STORAGE_PUBLIC_URL`)를 같은 의미로 설정하면 됩니다.
+
+---
+
+## 5. 클라우드 VM 프로덕션 — 자동 HTTPS (권장)
+
+프런트(Vercel 등 HTTPS)에서 백엔드를 호출하려면 **백엔드도 HTTPS** 여야 합니다 — HTTPS 페이지가 HTTP API 를 부르면 브라우저가 mixed-content 로 **차단**합니다. 이 저장소는 **Caddy 리버스 프록시**로 도메인 인증서를 자동 발급/갱신하는 프로덕션 오버레이(`docker-compose.prod.yml` + `Caddyfile`)를 제공합니다.
+
+### 사전 준비
+1. **VM**: Ubuntu 등 Docker 설치 가능한 VM 1대 (최소 2 vCPU / 4GB RAM 권장, data 디스크 여유).
+2. **도메인**: 예 `api.posty.example.com`. 이 도메인의 **A 레코드를 VM 공인 IP** 로 지정. (도메인이 없으면 DuckDNS 같은 무료 서브도메인도 가능.)
+3. **방화벽/보안그룹**: 인바운드 **22(SSH) / 80 / 443** 만 열기.
+
+### 실행
+```bash
+# VM 에서 (Docker 미설치면: curl -fsSL https://get.docker.com | sh)
+git clone https://github.com/2026-01-CAU-Capstone/Posty_BE.git && cd Posty_BE
+cp .env.example .env
+#  .env 에 채우기:
+#    GEMINI_API_KEY=...   OPENAI_API_KEY=...
+#    DOMAIN=api.posty.example.com     ← A레코드가 이 VM 을 가리켜야 함
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+```
+
+- Caddy 가 첫 요청 시 Let's Encrypt 인증서를 자동 발급합니다 (80/443 열려 있고 DNS 가 맞아야 함).
+- 이 모드에선 **backend 직접 포트(:8787)는 닫히고 Caddy(:443)만 공개**됩니다.
+- 확인: `curl https://api.posty.example.com/api/health` → `{"ok":true}`
+
+### 프런트 연결
+```bash
+# Posty_FE
+VITE_API_BASE=https://api.posty.example.com npm run build   # → dist/ 를 Vercel/Netlify 에
+```
+
+> 이 구성은 로컬에서 `DOMAIN=localhost`(Caddy internal TLS)로 띄워 `https://localhost/api/health → {"ok":true}` 및 backend 미노출까지 검증했습니다.
