@@ -2,21 +2,21 @@
 
 레퍼런스 릴스 1개 + 내 소스 영상 여러 개를 주면, **레퍼런스의 편집 스타일을 따라** 자동 편집된 9:16 영상을 만들어 줍니다.
 
-프런트엔드와 백엔드가 **완전히 분리된** 구조입니다.
+프런트엔드와 백엔드는 **저장소가 분리**되어 있습니다. 이 저장소(**Posty_BE**)는 **백엔드 + 편집 파이프라인**이고, 프런트엔드(Vite + React UI)는 별도 저장소 [**Posty_FE**](https://github.com/2026-01-CAU-Capstone/Posty_FE) 에 있습니다.
 
-## 구조 (모노레포)
+## 구조 (이 저장소 = Posty_BE)
 
 ```
-posty-prototype/
-├── frontend/     Vite + React UI  (마법사: 레퍼런스 → 소스 → 옵션 → 생성)
+Posty_BE/
 ├── backend/      Hono API + in-process 작업 큐 (lib/ 파이프라인을 비동기로 실행)
 ├── lib/          편집 파이프라인 (Stage 0~4) — backend 가 import 해서 사용
 ├── assets/fonts/ 자막 burn-in 용 번들 한글 폰트 (gitignore — 스크립트로 설치)
 ├── ig-fetch/     (선택) Instagram URL → mp4 다운로드 FastAPI 서비스
-└── data/projects/{id}/   프로젝트별 산출물 (gitignore)
+├── scripts/      폰트 설치 등 보조 스크립트
+└── data/projects/{id}/   프로젝트별 산출물 (gitignore, 런타임 생성)
 ```
 
-> 프런트는 HTTP 로만 백엔드와 통신합니다 (기본 `http://localhost:8787`, `VITE_API_BASE` 로 변경).
+> 프런트엔드는 [Posty_FE](https://github.com/2026-01-CAU-Capstone/Posty_FE) 저장소에서 받아 실행하며, HTTP 로만 백엔드와 통신합니다 (기본 `http://localhost:8787`, 프런트의 `VITE_API_BASE` 로 변경).
 
 ## 파이프라인 (Stage 0~4)
 
@@ -38,9 +38,8 @@ posty-prototype/
 # 1) 자막용 한글 폰트 (~150MB, 전부 SIL OFL)
 powershell -ExecutionPolicy Bypass -File scripts\install-fonts.ps1
 
-# 2) 백엔드 / 프런트 의존성
+# 2) 백엔드 의존성
 cd backend;  npm install
-cd ..\frontend; npm install
 ```
 
 폰트는 시스템 설치가 아니라 `assets/fonts/` 번들을 FFmpeg `subtitles=...:fontsdir=...` 로 로드합니다. (자막 `font_category × font_personality` → [lib/fonts.ts](lib/fonts.ts) 매핑)
@@ -66,15 +65,17 @@ FFMPEG_SCENE_SKIP_NONREF=       # '1' 이면 B프레임 디코드 생략 (CPU �
 cd backend
 npm run dev
 
-# 터미널 2 — 프런트 (:5173)
-cd frontend
-npm run dev
-# → 브라우저에서 http://localhost:5173
-
-# (IG URL 을 쓸 때만) 터미널 3 — ig-fetch (:8000)
+# (IG URL 을 쓸 때만) 터미널 2 — ig-fetch (:8000)
 cd ig-fetch
 uvicorn app.main:app --port 8000
 ```
+
+> 프런트엔드(:5173)는 별도 저장소 [Posty_FE](https://github.com/2026-01-CAU-Capstone/Posty_FE) 에서 실행합니다:
+> ```powershell
+> # Posty_FE 클론 후 루트에서
+> npm install
+> npm run dev   # → http://localhost:5173
+> ```
 
 프런트 헤더의 **"백엔드 연결됨"** 초록 배지가 보이면 연결 OK.
 
