@@ -30,6 +30,8 @@ Posty_BE/
 
 각 단계는 체크포인트 파일을 남겨서 한 단계만 다시 돌릴 수 있습니다 (`POST /api/run` `mode:'stage'`).
 
+다음은 Localhost에서 돌릴 시 필요한 사항들입니다.
+
 ## 설치
 
 필요: **Node 18+**, **FFmpeg/FFprobe** (PATH). Windows full build: https://www.gyan.dev/ffmpeg/builds/
@@ -104,11 +106,3 @@ tts-config.json  tts-outline.json
 - LLM 프롬프트: `lib/prompts.ts` 한 파일.
 - 모델 교체: `.env.local` 의 `GEMINI_*_MODEL` / `OPENAI_*_MODEL`.
 - 영상 분석/임베딩 제공자 교체: `lib/gemini.ts` / `lib/openai.ts` 호출부.
-
-## 한계
-
-- 컷 경계/하이라이트는 FFmpeg scene detect + LLM 추정 결합 (프레임 정확도는 아님).
-- 색 보정은 채도/대비/색온도 단순 매칭 (필름 LUT 등 복합 그레이딩은 미흡).
-- 긴 소스는 임베딩 중복제거 + 품질/내러티브 기준으로 **30~60초로 자동 축약**.
-- BGM 은 업로드본 우선, 없으면 Internet Archive 무료 음원 검색·매칭 (생성형 아님). 레퍼런스 상용곡은 저작권상 임베드하지 않고 정보/매칭 가이드로만 사용.
-- 전환 효과는 단순 cut.
