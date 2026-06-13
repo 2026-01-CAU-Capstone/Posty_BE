@@ -557,14 +557,3 @@ BACKEND_PORT=8787
 WORKER_CONCURRENCY=1            # ffmpeg CPU 폭주 방지
 ```
 
----
-
-## 12. 한계 / 알려진 제약
-
-- 컷 경계/하이라이트: FFmpeg scene detect + LLM 추정 결합 (프레임 정확도는 아님)
-- 색 보정: 채도/대비/색온도 단순 매칭 (필름 LUT 등 복합 그레이딩 미흡)
-- 긴 소스: 임베딩 dedup + 품질/내러티브 기준으로 30~60초 자동 축약
-- BGM: 업로드본 우선, 없으면 Internet Archive 무료 음원 검색·매칭 (생성형 아님). 레퍼런스 상용곡은 저작권상 임베드하지 않고 정보/매칭 가이드로만 사용
-- 전환 효과: 단순 cut (fade/whip/match_cut 등은 spec에 잡히지만 렌더는 cut)
-- 작업 큐: in-process 메모리. 프로세스 재시작 시 진행 상태 손실 (MVP)
-- ig-fetch BackgroundTasks: 단일 프로세스, 재시작 시 pending → failed 마킹 후 retry 가능. 규모 시 Celery+Redis 마이그레이션 권장
